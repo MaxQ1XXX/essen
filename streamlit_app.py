@@ -56,28 +56,39 @@ DISH_PROFILES = {
     "甜品/奶米糊/冰淇淋/蛋糕": {"kcal": 360, "protein": 8, "carbs": 58, "fat": 10, "fiber": 2, "co2e_g": 650},
 }
 
+DEFAULT_FOODS_VERSION = "2026-07-08_v6_verified_default_foods"
+
+# 默认食物库：每 100 g。宏量营养按“常见标签/公开数据库值”重新核实。
+# 说明：不同品牌、熟/生状态、含水量和脂肪比例会显著改变数值；app 内仍可手动编辑。
+# co2e_g 保留为内部字段，但默认设为 0，避免把粗略碳排误当成营养数据。
 DEFAULT_FOODS = [
-    {"name": "乳清蛋白粉", "kcal": 390, "protein": 78, "carbs": 8, "fat": 6, "fiber": 0, "co2e_g": 350, "category": "protein", "initials": "rqdbf", "note": "每100g，40g约31g蛋白"},
-    {"name": "全蛋", "kcal": 143, "protein": 12.6, "carbs": 0.7, "fat": 9.5, "fiber": 0, "co2e_g": 450, "category": "protein_fat", "initials": "qd", "note": "每100g"},
-    {"name": "农夫面包 Bauernbrot", "kcal": 225, "protein": 6, "carbs": 45, "fat": 1, "fiber": 0, "co2e_g": 0, "category": "carb", "initials": "nfmb", "note": "来自用户数据"},
-    {"name": "土豆/生重", "kcal": 77, "protein": 2, "carbs": 17, "fat": 0.1, "fiber": 2.2, "co2e_g": 35, "category": "carb", "initials": "td", "note": "生重"},
-    {"name": "牛肋排", "kcal": 256, "protein": 28, "carbs": 0.1, "fat": 16, "fiber": 0, "co2e_g": 0, "category": "protein_fat", "initials": "nlp", "note": "来自用户数据"},
-    {"name": "西红柿", "kcal": 20, "protein": 1, "carbs": 6, "fat": 0.2, "fiber": 1.5, "co2e_g": 0, "category": "veg", "initials": "xhs", "note": "来自用户数据"},
-    {"name": "干意面", "kcal": 353, "protein": 13, "carbs": 72, "fat": 1.5, "fiber": 3, "co2e_g": 150, "category": "carb", "initials": "gym", "note": "干重"},
-    {"name": "干米", "kcal": 360, "protein": 7, "carbs": 80, "fat": 0.7, "fiber": 1.3, "co2e_g": 270, "category": "carb", "initials": "gm", "note": "干重"},
-    {"name": "橄榄油", "kcal": 884, "protein": 0, "carbs": 0, "fat": 100, "fiber": 0, "co2e_g": 530, "category": "fat", "initials": "gly", "note": "每100g"},
-    {"name": "洋葱", "kcal": 42, "protein": 1, "carbs": 9.3, "fat": 0.1, "fiber": 1.5, "co2e_g": 0, "category": "veg", "initials": "yc", "note": "来自用户数据"},
-    {"name": "燕麦片", "kcal": 370, "protein": 13.5, "carbs": 58.7, "fat": 7, "fiber": 10, "co2e_g": 90, "category": "carb", "initials": "ymp", "note": "每100g"},
-    {"name": "牛肉馅", "kcal": 230, "protein": 16, "carbs": 0.1, "fat": 10, "fiber": 0, "co2e_g": 0, "category": "protein_fat", "initials": "nrx", "note": "来自用户数据"},
-    {"name": "生鸡胸肉", "kcal": 110, "protein": 23, "carbs": 0, "fat": 1.5, "fiber": 0, "co2e_g": 560, "category": "protein", "initials": "sjxr", "note": "生重"},
-    {"name": "瘦牛肉/约5%脂肪", "kcal": 137, "protein": 21, "carbs": 0, "fat": 5, "fiber": 0, "co2e_g": 2700, "category": "protein", "initials": "snr", "note": "生重估算"},
-    {"name": "白菜/生菜/菠菜", "kcal": 15, "protein": 1.1, "carbs": 1.2, "fat": 0.3, "fiber": 2, "co2e_g": 0, "category": "veg", "initials": "bcsc", "note": "来自用户数据"},
-    {"name": "五香牛腱/熟肉", "kcal": 213, "protein": 15.7, "carbs": 1.5, "fat": 16, "fiber": 0, "co2e_g": 0, "category": "protein_fat", "initials": "wynxcdz", "note": "原CSV名称损坏，根据拼音暂定"},
-    {"name": "虾仁", "kcal": 99, "protein": 24, "carbs": 0.2, "fat": 0.3, "fiber": 0, "co2e_g": 1000, "category": "protein", "initials": "xr", "note": "每100g"},
-    {"name": "西兰花/蔬菜", "kcal": 34, "protein": 2.8, "carbs": 7, "fat": 0.4, "fiber": 3, "co2e_g": 45, "category": "veg", "initials": "xlh", "note": "每100g"},
-    {"name": "西瓜", "kcal": 30, "protein": 0.6, "carbs": 7.6, "fat": 0.2, "fiber": 0.4, "co2e_g": 0, "category": "fruit", "initials": "xg", "note": "来自用户数据"},
-    {"name": "鸡腿肉去皮/生重", "kcal": 125, "protein": 20, "carbs": 0, "fat": 5, "fiber": 0, "co2e_g": 560, "category": "protein", "initials": "jtr", "note": "生重"},
+    {"name": "乳清蛋白粉", "kcal": 390, "protein": 78.0, "carbs": 8.0, "fat": 6.0, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "rqdbf", "note": "通用乳清粉；品牌差异很大，优先按你包装标签修改。40g≈156kcal/P31g"},
+    {"name": "全蛋", "kcal": 143, "protein": 12.6, "carbs": 0.7, "fat": 9.5, "fiber": 0.0, "co2e_g": 0, "category": "protein_fat", "initials": "qd", "note": "生全蛋，每100g；约2个中等鸡蛋可食部"},
+    {"name": "农夫面包 Bauernbrot", "kcal": 240, "protein": 7.8, "carbs": 47.0, "fat": 1.7, "fiber": 5.5, "co2e_g": 0, "category": "carb", "initials": "nfmb", "note": "德国混合黑麦/小麦面包常见值；不同品牌差异明显"},
+    {"name": "土豆/生重", "kcal": 77, "protein": 2.0, "carbs": 17.5, "fat": 0.1, "fiber": 2.2, "co2e_g": 0, "category": "carb", "initials": "td", "note": "生重，带皮/去皮差异小；烹饪后按熟重需另建条目"},
+    {"name": "牛肋排", "kcal": 291, "protein": 16.8, "carbs": 0.0, "fat": 25.2, "fiber": 0.0, "co2e_g": 0, "category": "protein_fat", "initials": "nlp", "note": "牛肋排脂肪波动很大；此为偏肥可食部估算"},
+    {"name": "西红柿", "kcal": 18, "protein": 0.9, "carbs": 3.9, "fat": 0.2, "fiber": 1.2, "co2e_g": 0, "category": "veg", "initials": "xhs", "note": "生番茄，每100g"},
+    {"name": "干意面", "kcal": 350, "protein": 13.0, "carbs": 72.0, "fat": 1.5, "fiber": 3.0, "co2e_g": 0, "category": "carb", "initials": "gym", "note": "干重；德国普通意面标签常见值"},
+    {"name": "干米", "kcal": 365, "protein": 7.1, "carbs": 80.0, "fat": 0.7, "fiber": 1.3, "co2e_g": 0, "category": "carb", "initials": "gm", "note": "干重；煮熟后重量约变为2.5–3倍"},
+    {"name": "橄榄油", "kcal": 884, "protein": 0.0, "carbs": 0.0, "fat": 100.0, "fiber": 0.0, "co2e_g": 0, "category": "fat", "initials": "gly", "note": "纯油脂，每100g；10g≈88kcal"},
+    {"name": "洋葱", "kcal": 40, "protein": 1.1, "carbs": 9.3, "fat": 0.1, "fiber": 1.7, "co2e_g": 0, "category": "veg", "initials": "yc", "note": "生洋葱，每100g"},
+    {"name": "燕麦片", "kcal": 372, "protein": 13.5, "carbs": 58.7, "fat": 7.0, "fiber": 10.0, "co2e_g": 0, "category": "carb", "initials": "ymp", "note": "干燕麦片；碳水按欧盟标签口径，纤维单列"},
+    {"name": "牛肉馅", "kcal": 254, "protein": 17.2, "carbs": 0.0, "fat": 20.0, "fiber": 0.0, "co2e_g": 0, "category": "protein_fat", "initials": "nrx", "note": "按常见80/20牛肉馅估算；若包装写10%脂肪请用“牛肉末/约10%脂肪”"},
+    {"name": "生鸡胸肉", "kcal": 120, "protein": 22.5, "carbs": 0.0, "fat": 2.6, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "sjxr", "note": "去皮鸡胸生重；熟重会因失水变高"},
+    {"name": "瘦牛肉/约5%脂肪", "kcal": 137, "protein": 21.0, "carbs": 0.0, "fat": 5.0, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "snr", "note": "约5%脂肪生重估算"},
+    {"name": "白菜/生菜/菠菜", "kcal": 20, "protein": 1.7, "carbs": 2.5, "fat": 0.3, "fiber": 1.8, "co2e_g": 0, "category": "veg", "initials": "bcsc", "note": "叶菜混合估算；菠菜蛋白/纤维更高，生菜更低"},
+    {"name": "五香牛腱/熟肉", "kcal": 180, "protein": 29.0, "carbs": 1.0, "fat": 7.0, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "wynxcdz", "note": "熟牛腱/卤牛肉估算；原CSV中文损坏，按首字母暂定"},
+    {"name": "虾仁", "kcal": 99, "protein": 24.0, "carbs": 0.2, "fat": 0.3, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "xr", "note": "熟虾仁常见值；生虾会略低"},
+    {"name": "西兰花/蔬菜", "kcal": 34, "protein": 2.8, "carbs": 6.6, "fat": 0.4, "fiber": 2.6, "co2e_g": 0, "category": "veg", "initials": "xlh", "note": "按生西兰花估算；其他蔬菜请单独添加"},
+    {"name": "西瓜", "kcal": 30, "protein": 0.6, "carbs": 7.6, "fat": 0.2, "fiber": 0.4, "co2e_g": 0, "category": "fruit", "initials": "xg", "note": "生西瓜，每100g"},
+    {"name": "鸡腿肉去皮/生重", "kcal": 119, "protein": 19.5, "carbs": 0.0, "fat": 4.5, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "jtr", "note": "去皮鸡腿肉生重估算"},
+    {"name": "熟米饭", "kcal": 130, "protein": 2.7, "carbs": 28.2, "fat": 0.3, "fiber": 0.4, "co2e_g": 0, "category": "carb", "initials": "smf", "note": "熟白米饭，每100g"},
+    {"name": "蛋清", "kcal": 52, "protein": 10.9, "carbs": 0.7, "fat": 0.2, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "dq", "note": "生蛋清，每100g"},
+    {"name": "Magerquark", "kcal": 67, "protein": 12.0, "carbs": 4.0, "fat": 0.2, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "mq", "note": "德国低脂夸克常见标签；按实际品牌微调"},
+    {"name": "Skyr natur", "kcal": 61, "protein": 11.0, "carbs": 3.7, "fat": 0.2, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "skyr", "note": "原味Skyr常见标签；按实际品牌微调"},
+    {"name": "牛肉末/约10%脂肪", "kcal": 176, "protein": 20.0, "carbs": 0.0, "fat": 10.0, "fiber": 0.0, "co2e_g": 0, "category": "protein_fat", "initials": "nrm", "note": "90/10生牛肉末，每100g"},
 ]
+
 
 DAY_WORD_RE = re.compile(r"^(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag)$", re.I)
 PRICE_RE = re.compile(r"(\d+[,.]\d{2}\s*€|ausverkauft)", re.I)
@@ -400,6 +411,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             insert_default_foods(conn)
         meta_set(conn, "seeded_default_foods", "1")
 
+    # v6：自动把“仍然存在且名称匹配的默认食物”更新为核实后的数值。
+    # 不会恢复已删除的默认食物，也不会改名后无法匹配的用户自定义项目。
+    if meta_get(conn, "default_food_values_version", "") != DEFAULT_FOODS_VERSION:
+        update_existing_default_food_values(conn)
+        meta_set(conn, "default_food_values_version", DEFAULT_FOODS_VERSION)
+
 
 def insert_default_foods(conn: sqlite3.Connection) -> None:
     now = datetime.now().isoformat(timespec="seconds")
@@ -420,6 +437,24 @@ def reset_default_foods(conn: sqlite3.Connection) -> None:
     conn.commit()
     insert_default_foods(conn)
     meta_set(conn, "seeded_default_foods", "1")
+
+
+def update_existing_default_food_values(conn: sqlite3.Connection) -> int:
+    """Update rows that still have the exact default names. Do not insert deleted defaults."""
+    now = datetime.now().isoformat(timespec="seconds")
+    changed = 0
+    for v in DEFAULT_FOODS:
+        cur = conn.execute(
+            """
+            UPDATE foods
+            SET kcal=?, protein=?, carbs=?, fat=?, fiber=?, co2e_g=?, category=?, initials=?, note=?, updated_at=?
+            WHERE name=?
+            """,
+            (v["kcal"], v["protein"], v["carbs"], v["fat"], v["fiber"], v["co2e_g"], v["category"], v["initials"], v["note"], now, v["name"]),
+        )
+        changed += cur.rowcount
+    conn.commit()
+    return changed
 
 
 def save_week_menu(conn: sqlite3.Connection, week_key: str, rows: List[MenuDish], replace: bool = True) -> None:
@@ -990,6 +1025,14 @@ def render_food_db_tab(conn: sqlite3.Connection) -> None:
     table_df = df_from_rows(foods, ["id", "name", "kcal", "protein", "carbs", "fat", "fiber", "category", "initials", "note"])
     st.dataframe(table_df, use_container_width=True, hide_index=True)
 
+    c_fix1, c_fix2 = st.columns([1, 2])
+    if c_fix1.button("更新现有默认食物为核实值"):
+        n = update_existing_default_food_values(conn)
+        meta_set(conn, "default_food_values_version", DEFAULT_FOODS_VERSION)
+        st.success(f"已更新 {n} 条仍然存在且名称匹配的默认食物。不会恢复已删除项目。")
+        rerun()
+    c_fix2.caption(f"默认食物数值版本：{DEFAULT_FOODS_VERSION}")
+
     st.divider()
     st.markdown("### 新增食物")
     with st.form("add_food_form", clear_on_submit=True):
@@ -997,13 +1040,13 @@ def render_food_db_tab(conn: sqlite3.Connection) -> None:
         name = c1.text_input("名称")
         category = c2.text_input("类别", value="custom")
         initials = c3.text_input("拼音首字母/缩写")
-        c4, c5, c6, c7, c8, c9 = st.columns(6)
+        c4, c5, c6, c7, c8 = st.columns(5)
         kcal = c4.number_input("kcal/100g", value=100.0)
         protein = c5.number_input("蛋白/100g", value=0.0)
         carbs = c6.number_input("碳水/100g", value=0.0)
         fat = c7.number_input("脂肪/100g", value=0.0)
         fiber = c8.number_input("纤维/100g", value=0.0)
-        co2e_g = c9.number_input("CO2e内部字段", value=0.0)
+        co2e_g = 0.0
         note = st.text_input("备注")
         submitted = st.form_submit_button("添加食物")
         if submitted:
@@ -1033,13 +1076,13 @@ def render_food_db_tab(conn: sqlite3.Connection) -> None:
                 name_e = c1.text_input("名称", value=str(food["name"]))
                 category_e = c2.text_input("类别", value=str(row_value(food, "category", "custom")))
                 initials_e = c3.text_input("拼音首字母/缩写", value=str(row_value(food, "initials", "")))
-                c4, c5, c6, c7, c8, c9 = st.columns(6)
+                c4, c5, c6, c7, c8 = st.columns(5)
                 kcal_e = c4.number_input("kcal/100g", value=float(row_value(food, "kcal", 0)), key="edit_kcal")
                 protein_e = c5.number_input("蛋白/100g", value=float(row_value(food, "protein", 0)), key="edit_p")
                 carbs_e = c6.number_input("碳水/100g", value=float(row_value(food, "carbs", 0)), key="edit_c")
                 fat_e = c7.number_input("脂肪/100g", value=float(row_value(food, "fat", 0)), key="edit_f")
                 fiber_e = c8.number_input("纤维/100g", value=float(row_value(food, "fiber", 0)), key="edit_fiber")
-                co2_e = c9.number_input("CO2e内部字段", value=float(row_value(food, "co2e_g", 0)), key="edit_co2")
+                co2_e = float(row_value(food, "co2e_g", 0))
                 note_e = st.text_input("备注", value=str(row_value(food, "note", "")))
                 saved = st.form_submit_button("保存修改")
                 if saved:
@@ -1065,7 +1108,7 @@ def render_food_db_tab(conn: sqlite3.Connection) -> None:
 
     st.divider()
     st.markdown("### 批量导入食物 CSV/TXT")
-    st.caption("支持逗号、分号、Tab 分隔。建议列名：name,kcal,protein,carbs,fat,fiber,co2e_g,category,initials,note。已有名称不会覆盖，避免误改；需要修改请用上方编辑表单。")
+    st.caption("支持逗号、分号、Tab 分隔。建议列名：name,kcal,protein,carbs,fat,fiber,category,initials,note。已有名称不会覆盖，避免误改；需要修改请用上方编辑表单。")
     upload = st.file_uploader("上传食物 CSV/TXT", type=["csv", "txt", "tsv"], key="food_bulk_upload")
     if upload is not None and st.button("导入上传的食物"):
         text = upload.read().decode("utf-8", errors="replace")
