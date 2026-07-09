@@ -1,2 +1,2 @@
-streamlit>=1.32
-pandas>=2.0
+streamlit>=1.37.0
+pandas>=2.0.0

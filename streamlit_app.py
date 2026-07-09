@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Alte Mensa 减脂营养记录器 - Streamlit 手动数据库 + ChatGPT菜单导入版
+Alte Mensa 减脂营养记录器 - Streamlit v7
+
+核心逻辑：
+1. 食物数据库完全本地手动维护，不联网。
+2. 食堂菜单可以导入 ChatGPT 已估算好的 CSV/JSON。
+3. 食物库支持原表格内直接修改；修改后自动保存到 SQLite。
+4. 食物库可导出为 foods_master.csv，放到 GitHub 后作为下次部署/重启的种子数据。
 
 运行：
     pip install -r requirements.txt
     streamlit run streamlit_app.py
-
-设计逻辑：
-1. 食物数据库完全本地手动维护，不联网，不自动恢复已删除的默认食物。
-2. Mensa 菜单可以抓取/上传/粘贴后解析菜名。
-3. App 生成一段提示词，用户复制到 ChatGPT 估算一周菜单营养。
-4. 用户把 ChatGPT 返回的 JSON/CSV 粘贴回 App，保存成本周菜单。
-5. 每天记录、食物库、体重和周/月汇总都保存到 SQLite。
 """
 
 from __future__ import annotations
@@ -21,8 +20,6 @@ import io
 import json
 import re
 import sqlite3
-import urllib.request
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -31,10 +28,11 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "Alte Mensa 减脂营养记录器"
-DEFAULT_URL = "https://www.studentenwerk-dresden.de/mensen/speiseplan/alte-mensa.html"
-DB_PATH = Path(__file__).with_name("mensa_streamlit.sqlite3")
-MACRO_KEYS = ["kcal", "protein", "carbs", "fat", "fiber", "co2e_g"]
-DISPLAY_MACRO_KEYS = ["kcal", "protein", "carbs", "fat", "fiber"]
+APP_VERSION = "v7 食物库自动保存 + GitHub seed CSV"
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "mensa_streamlit.sqlite3"
+FOODS_SEED_PATH = BASE_DIR / "foods_master.csv"
+MACRO_KEYS = ["kcal", "protein", "carbs", "fat", "fiber"]
 
 TARGET_PRESETS = {
     "训练日 2300 / P190 C210 F62": {"kcal": 2300.0, "protein": 190.0, "carbs": 210.0, "fat": 62.0},
@@ -43,78 +41,65 @@ TARGET_PRESETS = {
     "自定义": {"kcal": 2300.0, "protein": 190.0, "carbs": 210.0, "fat": 62.0},
 }
 
-# 只用于菜单未经过 ChatGPT 估算时的占位估算；最终推荐用 ChatGPT JSON/CSV 导入。
-DISH_PROFILES = {
-    "鸡肉/瘦肉+主食": {"kcal": 680, "protein": 45, "carbs": 75, "fat": 20, "fiber": 6, "co2e_g": 1350},
-    "鱼+主食": {"kcal": 650, "protein": 38, "carbs": 65, "fat": 22, "fiber": 5, "co2e_g": 1600},
-    "牛肉/猪肉高脂": {"kcal": 850, "protein": 40, "carbs": 80, "fat": 38, "fiber": 5, "co2e_g": 2500},
-    "意面/千层面/焗面": {"kcal": 780, "protein": 28, "carbs": 95, "fat": 28, "fiber": 6, "co2e_g": 900},
-    "豆类/素肉/咖喱+主食": {"kcal": 650, "protein": 30, "carbs": 85, "fat": 18, "fiber": 12, "co2e_g": 650},
-    "炸物/汉堡/披萨/薯条": {"kcal": 980, "protein": 35, "carbs": 105, "fat": 45, "fiber": 7, "co2e_g": 1800},
-    "汤/小份/清淡餐": {"kcal": 380, "protein": 14, "carbs": 45, "fat": 12, "fiber": 7, "co2e_g": 500},
-    "沙拉吧含调味汁": {"kcal": 360, "protein": 15, "carbs": 30, "fat": 20, "fiber": 8, "co2e_g": 450},
-    "甜品/奶米糊/冰淇淋/蛋糕": {"kcal": 360, "protein": 8, "carbs": 58, "fat": 10, "fiber": 2, "co2e_g": 650},
+DEFAULT_FOODS: List[Dict[str, object]] = [
+    {"name": "乳清蛋白粉", "kcal": 390, "protein": 78, "carbs": 8, "fat": 6, "fiber": 0, "category": "protein", "initials": "rqdbf"},
+    {"name": "全蛋", "kcal": 143, "protein": 12.6, "carbs": 0.7, "fat": 9.5, "fiber": 0, "category": "protein_fat", "initials": "qd"},
+    {"name": "蛋清", "kcal": 52, "protein": 11, "carbs": 0.7, "fat": 0.2, "fiber": 0, "category": "protein", "initials": "dq"},
+    {"name": "农夫面包 Bauernbrot", "kcal": 240, "protein": 7.8, "carbs": 47, "fat": 1.7, "fiber": 5.5, "category": "carb", "initials": "nfmb"},
+    {"name": "干意面", "kcal": 353, "protein": 13, "carbs": 72, "fat": 1.5, "fiber": 3, "category": "carb", "initials": "gym"},
+    {"name": "干米", "kcal": 360, "protein": 7, "carbs": 80, "fat": 0.7, "fiber": 1.3, "category": "carb", "initials": "gm"},
+    {"name": "熟米饭", "kcal": 130, "protein": 2.7, "carbs": 28.2, "fat": 0.3, "fiber": 0.4, "category": "carb", "initials": "smf"},
+    {"name": "土豆/生重", "kcal": 77, "protein": 2, "carbs": 17, "fat": 0.1, "fiber": 2.2, "category": "carb", "initials": "td"},
+    {"name": "燕麦片", "kcal": 370, "protein": 13.5, "carbs": 58.7, "fat": 7, "fiber": 10, "category": "carb", "initials": "ymp"},
+    {"name": "橄榄油", "kcal": 884, "protein": 0, "carbs": 0, "fat": 100, "fiber": 0, "category": "fat", "initials": "gly"},
+    {"name": "洋葱", "kcal": 40, "protein": 1.1, "carbs": 9.3, "fat": 0.1, "fiber": 1.7, "category": "veg", "initials": "yc"},
+    {"name": "西红柿", "kcal": 18, "protein": 0.9, "carbs": 3.9, "fat": 0.2, "fiber": 1.2, "category": "veg", "initials": "xhs"},
+    {"name": "番茄/黄瓜/沙拉菜", "kcal": 20, "protein": 1, "carbs": 4, "fat": 0.2, "fiber": 1.3, "category": "veg", "initials": "fqhgslc"},
+    {"name": "白菜/生菜/菠菜", "kcal": 20, "protein": 1.7, "carbs": 2.5, "fat": 0.3, "fiber": 2.0, "category": "veg", "initials": "bcsc"},
+    {"name": "西兰花/蔬菜", "kcal": 34, "protein": 2.8, "carbs": 7, "fat": 0.4, "fiber": 3, "category": "veg", "initials": "xlh"},
+    {"name": "西瓜", "kcal": 30, "protein": 0.6, "carbs": 7.6, "fat": 0.2, "fiber": 0.4, "category": "fruit", "initials": "xg"},
+    {"name": "生鸡胸肉", "kcal": 120, "protein": 22.5, "carbs": 0, "fat": 2.6, "fiber": 0, "category": "protein", "initials": "sjxr"},
+    {"name": "鸡腿肉去皮/生重", "kcal": 119, "protein": 19.5, "carbs": 0, "fat": 4.5, "fiber": 0, "category": "protein", "initials": "jtr"},
+    {"name": "瘦牛肉/约5%脂肪", "kcal": 137, "protein": 21, "carbs": 0, "fat": 5, "fiber": 0, "category": "protein", "initials": "snr"},
+    {"name": "牛肉末/约10%脂肪", "kcal": 176, "protein": 20, "carbs": 0, "fat": 10, "fiber": 0, "category": "protein", "initials": "nrm"},
+    {"name": "牛肉馅/约20%脂肪", "kcal": 254, "protein": 17.2, "carbs": 0, "fat": 20, "fiber": 0, "category": "protein_fat", "initials": "nrx"},
+    {"name": "牛肋排", "kcal": 291, "protein": 16.8, "carbs": 0, "fat": 25.2, "fiber": 0, "category": "protein_fat", "initials": "nlp"},
+    {"name": "五香牛腱/熟肉", "kcal": 180, "protein": 29, "carbs": 1.5, "fat": 7, "fiber": 0, "category": "protein", "initials": "wxnj"},
+    {"name": "三文鱼", "kcal": 208, "protein": 20, "carbs": 0, "fat": 13, "fiber": 0, "category": "protein_fat", "initials": "swy"},
+    {"name": "虾仁", "kcal": 99, "protein": 24, "carbs": 0.2, "fat": 0.3, "fiber": 0, "category": "protein", "initials": "xr"},
+    {"name": "Magerquark", "kcal": 67, "protein": 12, "carbs": 4, "fat": 0.2, "fiber": 0, "category": "protein", "initials": "mq"},
+    {"name": "Skyr natur", "kcal": 63, "protein": 11, "carbs": 4, "fat": 0.2, "fiber": 0, "category": "protein", "initials": "skyr"},
+    {"name": "花生酱", "kcal": 588, "protein": 25, "carbs": 20, "fat": 50, "fiber": 6, "category": "fat", "initials": "hsj"},
+]
+
+FIELD_ALIASES = {
+    "kcal/100g": "kcal",
+    "P": "protein",
+    "C": "carbs",
+    "F": "fat",
+    "蛋白": "protein",
+    "碳水": "carbs",
+    "脂肪": "fat",
+    "纤维": "fiber",
+    "类别": "category",
+    "拼音": "initials",
+    "首字母": "initials",
 }
 
-DEFAULT_FOODS_VERSION = "2026-07-08_v6_verified_default_foods"
 
-# 默认食物库：每 100 g。宏量营养按“常见标签/公开数据库值”重新核实。
-# 说明：不同品牌、熟/生状态、含水量和脂肪比例会显著改变数值；app 内仍可手动编辑。
-# co2e_g 保留为内部字段，但默认设为 0，避免把粗略碳排误当成营养数据。
-DEFAULT_FOODS = [
-    {"name": "乳清蛋白粉", "kcal": 390, "protein": 78.0, "carbs": 8.0, "fat": 6.0, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "rqdbf", "note": "通用乳清粉；品牌差异很大，优先按你包装标签修改。40g≈156kcal/P31g"},
-    {"name": "全蛋", "kcal": 143, "protein": 12.6, "carbs": 0.7, "fat": 9.5, "fiber": 0.0, "co2e_g": 0, "category": "protein_fat", "initials": "qd", "note": "生全蛋，每100g；约2个中等鸡蛋可食部"},
-    {"name": "农夫面包 Bauernbrot", "kcal": 240, "protein": 7.8, "carbs": 47.0, "fat": 1.7, "fiber": 5.5, "co2e_g": 0, "category": "carb", "initials": "nfmb", "note": "德国混合黑麦/小麦面包常见值；不同品牌差异明显"},
-    {"name": "土豆/生重", "kcal": 77, "protein": 2.0, "carbs": 17.5, "fat": 0.1, "fiber": 2.2, "co2e_g": 0, "category": "carb", "initials": "td", "note": "生重，带皮/去皮差异小；烹饪后按熟重需另建条目"},
-    {"name": "牛肋排", "kcal": 291, "protein": 16.8, "carbs": 0.0, "fat": 25.2, "fiber": 0.0, "co2e_g": 0, "category": "protein_fat", "initials": "nlp", "note": "牛肋排脂肪波动很大；此为偏肥可食部估算"},
-    {"name": "西红柿", "kcal": 18, "protein": 0.9, "carbs": 3.9, "fat": 0.2, "fiber": 1.2, "co2e_g": 0, "category": "veg", "initials": "xhs", "note": "生番茄，每100g"},
-    {"name": "干意面", "kcal": 350, "protein": 13.0, "carbs": 72.0, "fat": 1.5, "fiber": 3.0, "co2e_g": 0, "category": "carb", "initials": "gym", "note": "干重；德国普通意面标签常见值"},
-    {"name": "干米", "kcal": 365, "protein": 7.1, "carbs": 80.0, "fat": 0.7, "fiber": 1.3, "co2e_g": 0, "category": "carb", "initials": "gm", "note": "干重；煮熟后重量约变为2.5–3倍"},
-    {"name": "橄榄油", "kcal": 884, "protein": 0.0, "carbs": 0.0, "fat": 100.0, "fiber": 0.0, "co2e_g": 0, "category": "fat", "initials": "gly", "note": "纯油脂，每100g；10g≈88kcal"},
-    {"name": "洋葱", "kcal": 40, "protein": 1.1, "carbs": 9.3, "fat": 0.1, "fiber": 1.7, "co2e_g": 0, "category": "veg", "initials": "yc", "note": "生洋葱，每100g"},
-    {"name": "燕麦片", "kcal": 372, "protein": 13.5, "carbs": 58.7, "fat": 7.0, "fiber": 10.0, "co2e_g": 0, "category": "carb", "initials": "ymp", "note": "干燕麦片；碳水按欧盟标签口径，纤维单列"},
-    {"name": "牛肉馅", "kcal": 254, "protein": 17.2, "carbs": 0.0, "fat": 20.0, "fiber": 0.0, "co2e_g": 0, "category": "protein_fat", "initials": "nrx", "note": "按常见80/20牛肉馅估算；若包装写10%脂肪请用“牛肉末/约10%脂肪”"},
-    {"name": "生鸡胸肉", "kcal": 120, "protein": 22.5, "carbs": 0.0, "fat": 2.6, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "sjxr", "note": "去皮鸡胸生重；熟重会因失水变高"},
-    {"name": "瘦牛肉/约5%脂肪", "kcal": 137, "protein": 21.0, "carbs": 0.0, "fat": 5.0, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "snr", "note": "约5%脂肪生重估算"},
-    {"name": "白菜/生菜/菠菜", "kcal": 20, "protein": 1.7, "carbs": 2.5, "fat": 0.3, "fiber": 1.8, "co2e_g": 0, "category": "veg", "initials": "bcsc", "note": "叶菜混合估算；菠菜蛋白/纤维更高，生菜更低"},
-    {"name": "五香牛腱/熟肉", "kcal": 180, "protein": 29.0, "carbs": 1.0, "fat": 7.0, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "wynxcdz", "note": "熟牛腱/卤牛肉估算；原CSV中文损坏，按首字母暂定"},
-    {"name": "虾仁", "kcal": 99, "protein": 24.0, "carbs": 0.2, "fat": 0.3, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "xr", "note": "熟虾仁常见值；生虾会略低"},
-    {"name": "西兰花/蔬菜", "kcal": 34, "protein": 2.8, "carbs": 6.6, "fat": 0.4, "fiber": 2.6, "co2e_g": 0, "category": "veg", "initials": "xlh", "note": "按生西兰花估算；其他蔬菜请单独添加"},
-    {"name": "西瓜", "kcal": 30, "protein": 0.6, "carbs": 7.6, "fat": 0.2, "fiber": 0.4, "co2e_g": 0, "category": "fruit", "initials": "xg", "note": "生西瓜，每100g"},
-    {"name": "鸡腿肉去皮/生重", "kcal": 119, "protein": 19.5, "carbs": 0.0, "fat": 4.5, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "jtr", "note": "去皮鸡腿肉生重估算"},
-    {"name": "熟米饭", "kcal": 130, "protein": 2.7, "carbs": 28.2, "fat": 0.3, "fiber": 0.4, "co2e_g": 0, "category": "carb", "initials": "smf", "note": "熟白米饭，每100g"},
-    {"name": "蛋清", "kcal": 52, "protein": 10.9, "carbs": 0.7, "fat": 0.2, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "dq", "note": "生蛋清，每100g"},
-    {"name": "Magerquark", "kcal": 67, "protein": 12.0, "carbs": 4.0, "fat": 0.2, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "mq", "note": "德国低脂夸克常见标签；按实际品牌微调"},
-    {"name": "Skyr natur", "kcal": 61, "protein": 11.0, "carbs": 3.7, "fat": 0.2, "fiber": 0.0, "co2e_g": 0, "category": "protein", "initials": "skyr", "note": "原味Skyr常见标签；按实际品牌微调"},
-    {"name": "牛肉末/约10%脂肪", "kcal": 176, "protein": 20.0, "carbs": 0.0, "fat": 10.0, "fiber": 0.0, "co2e_g": 0, "category": "protein_fat", "initials": "nrm", "note": "90/10生牛肉末，每100g"},
-]
+def clean_text(x: object) -> str:
+    if x is None:
+        return ""
+    return re.sub(r"\s+", " ", str(x).replace("\xa0", " ")).strip()
 
 
-DAY_WORD_RE = re.compile(r"^(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag)$", re.I)
-PRICE_RE = re.compile(r"(\d+[,.]\d{2}\s*€|ausverkauft)", re.I)
-CO2_RE = re.compile(r"(\d+(?:[,.]\d+)?)\s*(g|kg)?\s*(CO₂e?|CO2e?)", re.I)
-HTML_TAG_RE = re.compile(r"<[^>]+>")
-EXCLUDE_PHRASES = [
-    "Studentenwerk", "Datenschutz", "Impressum", "Barrierefreiheit", "Drucken", "Vorherige Woche",
-    "Nächste Woche", "Mensa wählen", "Suchbegriff", "Raster", "Liste", "Cookie", "Öffnungszeiten",
-    "Image:", "Info", "Infos", "KlimaTeller", "Leider keine Angebote", "Ihre Position", "Navigation",
-    "Speiseplan", "Startseite", "Legende", "Zusatzstoffe", "Allergene", "Campus", "Dresden",
-]
-
-
-@dataclass
-class MenuDish:
-    week_key: str
-    day: str
-    name: str
-    price: str = ""
-    kcal: float = 0.0
-    protein: float = 0.0
-    carbs: float = 0.0
-    fat: float = 0.0
-    fiber: float = 0.0
-    co2e_g: float = 0.0
-    note: str = ""
+def safe_float(x: object, default: float = 0.0) -> float:
+    try:
+        if x is None or str(x).strip() == "" or str(x).lower() == "nan":
+            return default
+        return float(str(x).replace(",", "."))
+    except Exception:
+        return default
 
 
 def today_str() -> str:
@@ -126,191 +111,34 @@ def current_week_key() -> str:
     return f"{y}-KW{w:02d}"
 
 
-def week_key_from_date(d: date) -> str:
-    y, w, _ = d.isocalendar()
-    return f"{y}-KW{w:02d}"
-
-
-def clean_text(s: Optional[str]) -> str:
-    if s is None:
-        return ""
-    s = str(s).replace("\xa0", " ").replace("&nbsp;", " ").replace("&amp;", "&")
-    return re.sub(r"[ \t\r\f\v]+", " ", s).strip()
-
-
-def safe_float(v, default: float = 0.0) -> float:
+def row_value(row, key: str, default=""):
     try:
-        if v is None or str(v).strip() == "":
-            return default
-        return float(str(v).replace(",", "."))
+        if isinstance(row, sqlite3.Row):
+            v = row[key]
+        elif isinstance(row, dict):
+            v = row.get(key, default)
+        else:
+            v = getattr(row, key, default)
+        return default if v is None else v
     except Exception:
         return default
 
 
-def row_value(obj, key, default=0):
-    try:
-        if obj is None:
-            return default
-        if isinstance(obj, sqlite3.Row):
-            val = obj[key]
-            return default if val is None else val
-        if isinstance(obj, dict):
-            val = obj.get(key, default)
-            return default if val is None else val
-        val = getattr(obj, key, default)
-        return default if val is None else val
-    except Exception:
-        return default
+def macro_from_row(row) -> Dict[str, float]:
+    return {k: safe_float(row_value(row, k, 0)) for k in MACRO_KEYS}
 
 
-def macro_from_obj(obj) -> Dict[str, float]:
-    return {k: safe_float(row_value(obj, k, 0), 0) for k in MACRO_KEYS}
+def scale_food(row, grams: float) -> Dict[str, float]:
+    factor = grams / 100.0
+    return {k: safe_float(row_value(row, k, 0)) * factor for k in MACRO_KEYS}
 
 
-def display_macro_from_obj(obj) -> Dict[str, float]:
-    return {k: safe_float(row_value(obj, k, 0), 0) for k in DISPLAY_MACRO_KEYS}
-
-
-def add_macros(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
+def sum_macros(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
     total = {k: 0.0 for k in MACRO_KEYS}
     for row in rows:
         for k in MACRO_KEYS:
-            total[k] += safe_float(row_value(row, k, 0), 0)
+            total[k] += safe_float(row_value(row, k, 0))
     return total
-
-
-def scale_food(food, grams: float) -> Dict[str, float]:
-    factor = grams / 100.0
-    return {k: safe_float(row_value(food, k, 0), 0) * factor for k in MACRO_KEYS}
-
-
-def strip_html_to_lines(html_or_text: str) -> List[str]:
-    text = html_or_text or ""
-    text = re.sub(r"(?is)<script.*?</script>", "\n", text)
-    text = re.sub(r"(?is)<style.*?</style>", "\n", text)
-    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
-    text = re.sub(r"(?i)</(p|div|li|tr|td|th|h\d|section|article|a|span)>", "\n", text)
-    text = HTML_TAG_RE.sub(" ", text)
-    replacements = {
-        "&euro;": "€", "&auml;": "ä", "&ouml;": "ö", "&uuml;": "ü", "&Auml;": "Ä", "&Ouml;": "Ö",
-        "&Uuml;": "Ü", "&szlig;": "ß", "&quot;": '"', "&#039;": "'", "&#x20ac;": "€", "&nbsp;": " ",
-    }
-    for k, v in replacements.items():
-        text = text.replace(k, v)
-    lines = [clean_text(x) for x in text.splitlines()]
-    return [x for x in lines if x]
-
-
-def looks_like_day(line: str) -> bool:
-    line = clean_text(line)
-    if DAY_WORD_RE.match(line):
-        return True
-    if any(line.startswith(d) for d in ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]):
-        return bool(re.search(r"\d{1,2}\.\s*", line) or len(line.split()) <= 6)
-    return False
-
-
-def looks_like_food_line(line: str) -> bool:
-    s = clean_text(line)
-    if len(s) < 6 or PRICE_RE.search(s) or CO2_RE.search(s):
-        return False
-    if any(p.lower() in s.lower() for p in EXCLUDE_PHRASES):
-        return False
-    if looks_like_day(s) or re.fullmatch(r"[\d,. €]+", s):
-        return False
-    return len(re.findall(r"[A-Za-zÄÖÜäöüß\u4e00-\u9fff]", s)) >= 4
-
-
-def classify_dish(name: str) -> str:
-    n = name.lower()
-    if any(k in n for k in ["softeis", "milchgrieß", "milchgriess", "kuchen", "dessert", "zimt", "pudding", "waffel", "streusel", "eis"]):
-        return "甜品/奶米糊/冰淇淋/蛋糕"
-    if any(k in n for k in ["burger", "pizza", "pommes", "schnitzel", "frittiert", "frittierte", "teigtaschen", "bratkartoffeln", "cordon"]):
-        return "炸物/汉堡/披萨/薯条"
-    if any(k in n for k in ["suppe", "terrine", "eintopf", "kaltschale"]):
-        return "汤/小份/清淡餐"
-    if "salat" in n and not any(k in n for k in ["lasagne", "auflauf", "dazu", "pasta"]):
-        return "沙拉吧含调味汁"
-    if any(k in n for k in ["seelachs", "fisch", "lachs", "kabeljau", "forelle", "fish"]):
-        return "鱼+主食"
-    if any(k in n for k in ["rind", "beef", "schwein", "bacon", "speck", "leber", "gulasch"]):
-        return "牛肉/猪肉高脂"
-    if any(k in n for k in ["pasta", "lasagne", "tortell", "nudel", "makkaroni", "spätzle", "spaetzle", "spaghetti", "auflauf", "gratin", "gnocchi"]):
-        return "意面/千层面/焗面"
-    if any(k in n for k in ["soja", "kichererbs", "chili sin", "brew bites", "gemüse", "gemuese", "linsen", "bohnen", "curry", "tofu", "falafel", "jackfruit", "vegan", "vegetar"]):
-        return "豆类/素肉/咖喱+主食"
-    if any(k in n for k in ["hähnchen", "haehnchen", "huhn", "pute", "chicken", "geschnetzeltes"]):
-        return "鸡肉/瘦肉+主食"
-    return "意面/千层面/焗面"
-
-
-def rule_estimate(name: str) -> Tuple[Dict[str, float], str]:
-    profile = classify_dish(name)
-    return dict(DISH_PROFILES[profile]), profile
-
-
-def parse_menu_from_text(text: str, week_key: str) -> List[MenuDish]:
-    lines = strip_html_to_lines(text)
-    rows: List[MenuDish] = []
-    current_day = "未识别日期"
-    seen = set()
-
-    for i, line in enumerate(lines):
-        if looks_like_day(line):
-            current_day = line
-            continue
-        price_match = PRICE_RE.search(line)
-        if not price_match:
-            continue
-        price = price_match.group(1)
-        food = ""
-        prefix = clean_text(line[: price_match.start()])
-        if looks_like_food_line(prefix):
-            food = prefix
-        else:
-            for j in range(i - 1, max(-1, i - 9), -1):
-                if looks_like_food_line(lines[j]):
-                    food = lines[j]
-                    break
-        if not food:
-            continue
-        macro, profile = rule_estimate(food)
-        co2 = 0.0
-        for j in range(i, min(len(lines), i + 5)):
-            m = CO2_RE.search(lines[j])
-            if m:
-                val = safe_float(m.group(1), 0)
-                co2 = val * 1000 if (m.group(2) or "").lower() == "kg" else val
-                break
-        if co2 > 0:
-            macro["co2e_g"] = co2
-        key = (current_day, food)
-        if key not in seen:
-            seen.add(key)
-            rows.append(MenuDish(week_key=week_key, day=current_day, name=food, price=price, note=f"本地粗估/{profile}", **macro))
-
-    if not rows:
-        for line in lines:
-            if looks_like_day(line):
-                current_day = line
-                continue
-            if looks_like_food_line(line):
-                macro, profile = rule_estimate(line)
-                key = (current_day, line)
-                if key not in seen:
-                    seen.add(key)
-                    rows.append(MenuDish(week_key=week_key, day=current_day, name=line, note=f"本地粗估/{profile}", **macro))
-    return rows
-
-
-def fetch_url_text(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 MensaNutritionStreamlit/1.0"})
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        raw = resp.read()
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("latin-1", errors="replace")
 
 
 def get_conn() -> sqlite3.Connection:
@@ -319,42 +147,60 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl_type: str) -> None:
-    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+def ensure_col(conn: sqlite3.Connection, table: str, col: str, definition: str) -> None:
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if col not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
         conn.commit()
 
 
-def meta_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
-    row = conn.execute("SELECT value FROM app_meta WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
-
-
-def meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
-    conn.execute(
-        "INSERT INTO app_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
-    conn.commit()
-
-
 def init_db(conn: sqlite3.Connection) -> None:
-    conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS foods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            kcal REAL DEFAULT 0,
+            protein REAL DEFAULT 0,
+            carbs REAL DEFAULT 0,
+            fat REAL DEFAULT 0,
+            fiber REAL DEFAULT 0,
+            category TEXT DEFAULT 'custom',
+            initials TEXT DEFAULT '',
+            updated_at TEXT
+        )
+        """
+    )
+    for col, definition in [
+        ("kcal", "REAL DEFAULT 0"), ("protein", "REAL DEFAULT 0"), ("carbs", "REAL DEFAULT 0"),
+        ("fat", "REAL DEFAULT 0"), ("fiber", "REAL DEFAULT 0"), ("category", "TEXT DEFAULT 'custom'"),
+        ("initials", "TEXT DEFAULT ''"), ("updated_at", "TEXT"),
+    ]:
+        ensure_col(conn, "foods", col, definition)
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS menu_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             week_key TEXT NOT NULL,
-            day TEXT NOT NULL,
+            date TEXT,
+            weekday TEXT,
+            day TEXT,
             name TEXT NOT NULL,
             price TEXT,
-            kcal REAL, protein REAL, carbs REAL, fat REAL, fiber REAL, co2e_g REAL,
-            note TEXT,
+            kcal REAL DEFAULT 0,
+            protein REAL DEFAULT 0,
+            carbs REAL DEFAULT 0,
+            fat REAL DEFAULT 0,
+            fiber REAL DEFAULT 0,
+            note TEXT DEFAULT '',
             created_at TEXT
         )
         """
     )
+    for col, definition in [("date", "TEXT"), ("weekday", "TEXT"), ("note", "TEXT DEFAULT ''"), ("fiber", "REAL DEFAULT 0")]:
+        ensure_col(conn, "menu_items", col, definition)
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS daily_records (
@@ -362,871 +208,534 @@ def init_db(conn: sqlite3.Connection) -> None:
             record_date TEXT NOT NULL,
             meal TEXT NOT NULL,
             name TEXT NOT NULL,
-            grams REAL,
-            kcal REAL, protein REAL, carbs REAL, fat REAL, fiber REAL, co2e_g REAL,
+            grams REAL DEFAULT 0,
+            kcal REAL DEFAULT 0,
+            protein REAL DEFAULT 0,
+            carbs REAL DEFAULT 0,
+            fat REAL DEFAULT 0,
+            fiber REAL DEFAULT 0,
+            note TEXT DEFAULT '',
             created_at TEXT
         )
         """
     )
+    for col, definition in [("fiber", "REAL DEFAULT 0"), ("note", "TEXT DEFAULT ''")]:
+        ensure_col(conn, "daily_records", col, definition)
+
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS foods (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            kcal REAL, protein REAL, carbs REAL, fat REAL, fiber REAL, co2e_g REAL,
-            category TEXT,
-            initials TEXT,
-            note TEXT,
-            updated_at TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS weekly_weights (
+        CREATE TABLE IF NOT EXISTS weight_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             week_key TEXT UNIQUE NOT NULL,
-            record_date TEXT,
-            weight_kg REAL,
-            waist_cm REAL,
-            note TEXT,
+            log_date TEXT NOT NULL,
+            weight_kg REAL NOT NULL,
+            note TEXT DEFAULT '',
             created_at TEXT
         )
         """
     )
     conn.commit()
 
-    # 兼容旧版数据库。旧列存在也不删除，界面不显示即可。
-    for col, typ in [("fiber", "REAL"), ("co2e_g", "REAL"), ("note", "TEXT"), ("created_at", "TEXT")]:
-        ensure_column(conn, "menu_items", col, typ)
-    for col, typ in [("fiber", "REAL"), ("co2e_g", "REAL"), ("created_at", "TEXT")]:
-        ensure_column(conn, "daily_records", col, typ)
-    for col, typ in [("fiber", "REAL"), ("co2e_g", "REAL"), ("category", "TEXT"), ("initials", "TEXT"), ("note", "TEXT"), ("updated_at", "TEXT")]:
-        ensure_column(conn, "foods", col, typ)
-
-    seeded = meta_get(conn, "seeded_default_foods", "0")
-    food_count = conn.execute("SELECT COUNT(*) AS n FROM foods").fetchone()["n"]
-    if seeded != "1":
-        if food_count == 0:
-            insert_default_foods(conn)
-        meta_set(conn, "seeded_default_foods", "1")
-
-    # v6：自动把“仍然存在且名称匹配的默认食物”更新为核实后的数值。
-    # 不会恢复已删除的默认食物，也不会改名后无法匹配的用户自定义项目。
-    if meta_get(conn, "default_food_values_version", "") != DEFAULT_FOODS_VERSION:
-        update_existing_default_food_values(conn)
-        meta_set(conn, "default_food_values_version", DEFAULT_FOODS_VERSION)
+    count = conn.execute("SELECT COUNT(*) FROM foods").fetchone()[0]
+    if count == 0:
+        seed_rows = read_food_seed_file() if FOODS_SEED_PATH.exists() else DEFAULT_FOODS
+        insert_food_seed(conn, seed_rows)
 
 
-def insert_default_foods(conn: sqlite3.Connection) -> None:
+def normalize_food_dict(d: Dict[str, object]) -> Optional[Dict[str, object]]:
+    renamed = {}
+    for k, v in d.items():
+        key = FIELD_ALIASES.get(clean_text(k), clean_text(k))
+        renamed[key] = v
+    name = clean_text(renamed.get("name", ""))
+    if not name:
+        return None
+    return {
+        "name": name,
+        "kcal": safe_float(renamed.get("kcal", 0)),
+        "protein": safe_float(renamed.get("protein", 0)),
+        "carbs": safe_float(renamed.get("carbs", 0)),
+        "fat": safe_float(renamed.get("fat", 0)),
+        "fiber": safe_float(renamed.get("fiber", 0)),
+        "category": clean_text(renamed.get("category", "custom")) or "custom",
+        "initials": clean_text(renamed.get("initials", "")).lower(),
+    }
+
+
+def read_food_seed_file() -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    try:
+        df = pd.read_csv(FOODS_SEED_PATH, encoding="utf-8-sig")
+    except Exception:
+        return []
+    for rec in df.to_dict("records"):
+        item = normalize_food_dict(rec)
+        if item:
+            rows.append(item)
+    return rows
+
+
+def insert_food_seed(conn: sqlite3.Connection, rows: List[Dict[str, object]]) -> None:
     now = datetime.now().isoformat(timespec="seconds")
-    for v in DEFAULT_FOODS:
+    for raw in rows:
+        item = normalize_food_dict(raw)
+        if not item:
+            continue
         conn.execute(
             """
             INSERT OR IGNORE INTO foods
-            (name, kcal, protein, carbs, fat, fiber, co2e_g, category, initials, note, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (name, kcal, protein, carbs, fat, fiber, category, initials, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (v["name"], v["kcal"], v["protein"], v["carbs"], v["fat"], v["fiber"], v["co2e_g"], v["category"], v["initials"], v["note"], now),
+            (item["name"], item["kcal"], item["protein"], item["carbs"], item["fat"], item["fiber"], item["category"], item["initials"], now),
         )
     conn.commit()
 
 
-def reset_default_foods(conn: sqlite3.Connection) -> None:
+def rebuild_foods_from_seed(conn: sqlite3.Connection, rows: Optional[List[Dict[str, object]]] = None) -> int:
+    if rows is None:
+        rows = read_food_seed_file() if FOODS_SEED_PATH.exists() else DEFAULT_FOODS
     conn.execute("DELETE FROM foods")
     conn.commit()
-    insert_default_foods(conn)
-    meta_set(conn, "seeded_default_foods", "1")
+    insert_food_seed(conn, rows)
+    return conn.execute("SELECT COUNT(*) FROM foods").fetchone()[0]
 
 
-def update_existing_default_food_values(conn: sqlite3.Connection) -> int:
-    """Update rows that still have the exact default names. Do not insert deleted defaults."""
-    now = datetime.now().isoformat(timespec="seconds")
-    changed = 0
-    for v in DEFAULT_FOODS:
-        cur = conn.execute(
-            """
-            UPDATE foods
-            SET kcal=?, protein=?, carbs=?, fat=?, fiber=?, co2e_g=?, category=?, initials=?, note=?, updated_at=?
-            WHERE name=?
-            """,
-            (v["kcal"], v["protein"], v["carbs"], v["fat"], v["fiber"], v["co2e_g"], v["category"], v["initials"], v["note"], now, v["name"]),
-        )
-        changed += cur.rowcount
-    conn.commit()
-    return changed
-
-
-def save_week_menu(conn: sqlite3.Connection, week_key: str, rows: List[MenuDish], replace: bool = True) -> None:
-    if replace:
-        conn.execute("DELETE FROM menu_items WHERE week_key=?", (week_key,))
-    now = datetime.now().isoformat(timespec="seconds")
-    for r in rows:
-        conn.execute(
-            """
-            INSERT INTO menu_items
-            (week_key, day, name, price, kcal, protein, carbs, fat, fiber, co2e_g, note, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (week_key, r.day, r.name, r.price, r.kcal, r.protein, r.carbs, r.fat, r.fiber, r.co2e_g, r.note, now),
-        )
-    conn.commit()
-
-
-def get_week_menu(conn: sqlite3.Connection, week_key: str) -> List[sqlite3.Row]:
-    return conn.execute("SELECT * FROM menu_items WHERE week_key=? ORDER BY id", (week_key,)).fetchall()
-
-
-def delete_week_menu(conn: sqlite3.Connection, week_key: str) -> None:
-    conn.execute("DELETE FROM menu_items WHERE week_key=?", (week_key,))
-    conn.commit()
-
-
-def update_menu_item(conn: sqlite3.Connection, item_id: int, vals: Dict[str, object]) -> None:
-    conn.execute(
-        """
-        UPDATE menu_items
-        SET day=?, name=?, price=?, kcal=?, protein=?, carbs=?, fat=?, fiber=?, co2e_g=?, note=?
-        WHERE id=?
-        """,
-        (vals["day"], vals["name"], vals["price"], vals["kcal"], vals["protein"], vals["carbs"], vals["fat"], vals["fiber"], vals["co2e_g"], vals["note"], item_id),
-    )
-    conn.commit()
-
-
-def delete_menu_item(conn: sqlite3.Connection, item_id: int) -> None:
-    conn.execute("DELETE FROM menu_items WHERE id=?", (item_id,))
-    conn.commit()
-
-
-def get_record_rows(conn: sqlite3.Connection, record_date: str) -> List[sqlite3.Row]:
-    return conn.execute("SELECT * FROM daily_records WHERE record_date=? ORDER BY id", (record_date,)).fetchall()
-
-
-def add_record(conn: sqlite3.Connection, record_date: str, meal: str, name: str, grams: float, macro: Dict[str, float]) -> None:
-    conn.execute(
-        """
-        INSERT INTO daily_records
-        (record_date, meal, name, grams, kcal, protein, carbs, fat, fiber, co2e_g, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (record_date, meal, name, grams, macro["kcal"], macro["protein"], macro["carbs"], macro["fat"], macro["fiber"], macro["co2e_g"], datetime.now().isoformat(timespec="seconds")),
-    )
-    conn.commit()
-
-
-def delete_record(conn: sqlite3.Connection, record_id: int) -> None:
-    conn.execute("DELETE FROM daily_records WHERE id=?", (record_id,))
-    conn.commit()
-
-
-def clear_day_records(conn: sqlite3.Connection, record_date: str) -> None:
-    conn.execute("DELETE FROM daily_records WHERE record_date=?", (record_date,))
-    conn.commit()
-
-
-def get_foods(conn: sqlite3.Connection, query: str = "") -> List[sqlite3.Row]:
+def foods_df(conn: sqlite3.Connection, query: str = "") -> pd.DataFrame:
     q = clean_text(query).lower()
-    if not q:
-        return conn.execute("SELECT * FROM foods ORDER BY id").fetchall()
-    like = f"%{q}%"
-    return conn.execute(
-        """
-        SELECT * FROM foods
-        WHERE lower(name) LIKE ? OR lower(category) LIKE ? OR lower(initials) LIKE ? OR lower(note) LIKE ?
-        ORDER BY id
-        """,
-        (like, like, like, like),
-    ).fetchall()
+    if q:
+        like = f"%{q}%"
+        rows = conn.execute(
+            """
+            SELECT id, name, kcal, protein, carbs, fat, fiber, category, initials
+            FROM foods
+            WHERE lower(name) LIKE ? OR lower(category) LIKE ? OR lower(initials) LIKE ?
+            ORDER BY name
+            """,
+            (like, like, like),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT id, name, kcal, protein, carbs, fat, fiber, category, initials FROM foods ORDER BY name").fetchall()
+    df = pd.DataFrame([dict(r) for r in rows])
+    if df.empty:
+        return pd.DataFrame(columns=["删除", "复制", "id", "name", *MACRO_KEYS, "category", "initials"])
+    df.insert(0, "复制", False)
+    df.insert(0, "删除", False)
+    return df
+
+
+def all_foods_as_csv(conn: sqlite3.Connection) -> str:
+    df = foods_df(conn, "").drop(columns=["删除", "复制"], errors="ignore")
+    ordered = ["name", "kcal", "protein", "carbs", "fat", "fiber", "category", "initials"]
+    return df[ordered].to_csv(index=False, encoding="utf-8-sig")
 
 
 def get_food_by_id(conn: sqlite3.Connection, food_id: int) -> Optional[sqlite3.Row]:
-    return conn.execute("SELECT * FROM foods WHERE id=?", (food_id,)).fetchone()
+    return conn.execute("SELECT * FROM foods WHERE id=?", (int(food_id),)).fetchone()
 
 
-def insert_food(conn: sqlite3.Connection, values: Dict[str, object]) -> int:
+def sync_food_editor(conn: sqlite3.Connection, edited_df: pd.DataFrame) -> Tuple[int, List[str]]:
+    """自动保存编辑表格中的普通字段。删除/复制不在这里处理。"""
+    changed = 0
+    errors: List[str] = []
     now = datetime.now().isoformat(timespec="seconds")
-    cur = conn.execute(
-        """
-        INSERT INTO foods (name, kcal, protein, carbs, fat, fiber, co2e_g, category, initials, note, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (values["name"], values["kcal"], values["protein"], values["carbs"], values["fat"], values["fiber"], values["co2e_g"], values["category"], values["initials"], values["note"], now),
-    )
+    if edited_df.empty:
+        return 0, []
+
+    for rec in edited_df.to_dict("records"):
+        food_id_raw = rec.get("id")
+        if pd.isna(food_id_raw) or str(food_id_raw).strip() == "":
+            continue
+        try:
+            food_id = int(food_id_raw)
+        except Exception:
+            continue
+        current = get_food_by_id(conn, food_id)
+        if current is None:
+            continue
+        name = clean_text(rec.get("name", ""))
+        if not name:
+            errors.append(f"id={food_id} 名称为空，已跳过。")
+            continue
+        values = {
+            "name": name,
+            "kcal": safe_float(rec.get("kcal", 0)),
+            "protein": safe_float(rec.get("protein", 0)),
+            "carbs": safe_float(rec.get("carbs", 0)),
+            "fat": safe_float(rec.get("fat", 0)),
+            "fiber": safe_float(rec.get("fiber", 0)),
+            "category": clean_text(rec.get("category", "custom")) or "custom",
+            "initials": clean_text(rec.get("initials", "")).lower(),
+        }
+        is_changed = False
+        for key, val in values.items():
+            old = row_value(current, key, "")
+            if key in MACRO_KEYS:
+                if abs(safe_float(old) - safe_float(val)) > 1e-9:
+                    is_changed = True
+                    break
+            else:
+                if clean_text(old) != clean_text(val):
+                    is_changed = True
+                    break
+        if not is_changed:
+            continue
+        try:
+            conn.execute(
+                """
+                UPDATE foods
+                SET name=?, kcal=?, protein=?, carbs=?, fat=?, fiber=?, category=?, initials=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    values["name"], values["kcal"], values["protein"], values["carbs"], values["fat"],
+                    values["fiber"], values["category"], values["initials"], now, food_id,
+                ),
+            )
+            changed += 1
+        except sqlite3.IntegrityError:
+            errors.append(f"id={food_id} 名称“{name}”与已有食物重复，未保存。")
+    if changed:
+        conn.commit()
+    return changed, errors
+
+
+def delete_food_ids(conn: sqlite3.Connection, ids: Iterable[int]) -> int:
+    ids = [int(x) for x in ids]
+    if not ids:
+        return 0
+    conn.executemany("DELETE FROM foods WHERE id=?", [(i,) for i in ids])
     conn.commit()
-    return int(cur.lastrowid)
+    return len(ids)
 
 
-def update_food_by_id(conn: sqlite3.Connection, food_id: int, values: Dict[str, object]) -> None:
+def copy_food_ids(conn: sqlite3.Connection, ids: Iterable[int]) -> int:
+    count = 0
+    now = datetime.now().isoformat(timespec="seconds")
+    for food_id in ids:
+        row = get_food_by_id(conn, int(food_id))
+        if row is None:
+            continue
+        base = clean_text(row["name"])
+        n = 1
+        while True:
+            new_name = f"{base}_复制{n}"
+            exists = conn.execute("SELECT 1 FROM foods WHERE name=?", (new_name,)).fetchone()
+            if not exists:
+                break
+            n += 1
+        conn.execute(
+            """
+            INSERT INTO foods (name, kcal, protein, carbs, fat, fiber, category, initials, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (new_name, row["kcal"], row["protein"], row["carbs"], row["fat"], row["fiber"], row["category"], row["initials"], now),
+        )
+        count += 1
+    if count:
+        conn.commit()
+    return count
+
+
+def upsert_food_by_name(conn: sqlite3.Connection, item: Dict[str, object]) -> None:
+    values = normalize_food_dict(item)
+    if not values:
+        raise ValueError("名称不能为空")
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         """
-        UPDATE foods
-        SET name=?, kcal=?, protein=?, carbs=?, fat=?, fiber=?, co2e_g=?, category=?, initials=?, note=?, updated_at=?
-        WHERE id=?
+        INSERT INTO foods (name, kcal, protein, carbs, fat, fiber, category, initials, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            kcal=excluded.kcal, protein=excluded.protein, carbs=excluded.carbs, fat=excluded.fat,
+            fiber=excluded.fiber, category=excluded.category, initials=excluded.initials, updated_at=excluded.updated_at
         """,
-        (values["name"], values["kcal"], values["protein"], values["carbs"], values["fat"], values["fiber"], values["co2e_g"], values["category"], values["initials"], values["note"], now, food_id),
+        (
+            values["name"], values["kcal"], values["protein"], values["carbs"], values["fat"],
+            values["fiber"], values["category"], values["initials"], now,
+        ),
     )
     conn.commit()
 
 
-def delete_food_by_id(conn: sqlite3.Connection, food_id: int) -> None:
-    conn.execute("DELETE FROM foods WHERE id=?", (food_id,))
-    conn.commit()
-
-
-def copy_food_by_id(conn: sqlite3.Connection, food_id: int) -> Optional[int]:
-    f = get_food_by_id(conn, food_id)
-    if f is None:
-        return None
-    base = f["name"] + "_复制"
-    existing = {r["name"] for r in conn.execute("SELECT name FROM foods WHERE name LIKE ?", (base + "%",)).fetchall()}
-    new_name = base
-    idx = 1
-    while new_name in existing:
-        idx += 1
-        new_name = f"{base}{idx}"
-    return insert_food(conn, {
-        "name": new_name,
-        "kcal": f["kcal"], "protein": f["protein"], "carbs": f["carbs"], "fat": f["fat"],
-        "fiber": f["fiber"], "co2e_g": f["co2e_g"], "category": f["category"],
-        "initials": f["initials"], "note": f"复制自 ID {food_id}",
-    })
-
-
-def rows_to_csv(rows: Iterable[sqlite3.Row | Dict[str, object]], fields: List[str]) -> str:
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=fields)
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({f: row_value(row, f, "") for f in fields})
-    return output.getvalue()
-
-
-def total_for_records(rows: Iterable[sqlite3.Row]) -> Dict[str, float]:
-    return add_macros(macro_from_obj(r) for r in rows)
-
-
-def extract_code_block(text: str) -> str:
-    text = clean_text(text)
-    if "```" not in text:
-        return text
-    m = re.search(r"```(?:json|csv)?\s*(.*?)\s*```", text, re.S | re.I)
-    return m.group(1).strip() if m else text.replace("```", "").strip()
-
-
-def normalize_key(k: str) -> str:
-    k = clean_text(k).lower().replace(" ", "").replace("_", "").replace("-", "")
-    return k.replace("₂", "2")
-
-
-def map_value(row: Dict[str, object], aliases: List[str], default=""):
-    normalized = {normalize_key(k): v for k, v in row.items()}
-    for a in aliases:
-        key = normalize_key(a)
-        if key in normalized:
-            return normalized[key]
-    return default
-
-
-def parse_chatgpt_menu_result(text: str, week_key: str) -> List[MenuDish]:
-    raw = extract_code_block(text)
-    if not raw:
-        return []
-
-    rows_raw: List[Dict[str, object]] = []
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            parsed = parsed.get("dishes") or parsed.get("items") or parsed.get("menu") or []
-        if isinstance(parsed, list):
-            rows_raw = [x for x in parsed if isinstance(x, dict)]
-    except Exception:
-        rows_raw = []
-
-    if not rows_raw:
-        try:
-            sample = raw[:2048]
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-        except Exception:
-            dialect = csv.excel
-        reader = csv.DictReader(io.StringIO(raw), dialect=dialect)
-        rows_raw = [dict(r) for r in reader]
-
-    out: List[MenuDish] = []
-    for r in rows_raw:
-        day = clean_text(str(map_value(r, ["day", "date", "日期", "星期", "Wochentag"], "未识别日期")))
-        name = clean_text(str(map_value(r, ["name", "dish", "food", "菜品", "名称", "Gericht", "Speise"], "")))
+def parse_imported_menu(file_bytes: bytes, filename: str) -> List[Dict[str, object]]:
+    text = file_bytes.decode("utf-8-sig", errors="replace")
+    fn = filename.lower()
+    rows: List[Dict[str, object]] = []
+    if fn.endswith(".json") or text.strip().startswith("["):
+        data = json.loads(text)
+        if isinstance(data, dict):
+            data = data.get("items") or data.get("dishes") or []
+        if not isinstance(data, list):
+            raise ValueError("JSON 必须是数组，或包含 items/dishes 数组。")
+        for item in data:
+            if isinstance(item, dict):
+                rows.append(item)
+    else:
+        reader = csv.DictReader(io.StringIO(text))
+        rows = [dict(r) for r in reader]
+    out = []
+    for r in rows:
+        name = clean_text(r.get("name", ""))
         if not name:
             continue
-        price = clean_text(str(map_value(r, ["price", "价格", "Preis"], "")))
-        note = clean_text(str(map_value(r, ["note", "备注", "依据", "估算依据", "reason"], "ChatGPT估算")))
-        out.append(MenuDish(
-            week_key=week_key,
-            day=day,
-            name=name,
-            price=price,
-            kcal=safe_float(map_value(r, ["kcal", "calories", "热量", "卡路里"], 0)),
-            protein=safe_float(map_value(r, ["protein", "p", "蛋白", "蛋白质"], 0)),
-            carbs=safe_float(map_value(r, ["carbs", "carbohydrate", "c", "碳水", "碳水化合物"], 0)),
-            fat=safe_float(map_value(r, ["fat", "f", "脂肪"], 0)),
-            fiber=safe_float(map_value(r, ["fiber", "fibre", "膳食纤维", "纤维"], 0)),
-            co2e_g=safe_float(map_value(r, ["co2e_g", "co2e", "co2", "co₂e", "co₂eg", "碳排", "碳排放"], 0)),
-            note=note,
-        ))
+        day = clean_text(r.get("day", ""))
+        rec = {
+            "week_key": clean_text(r.get("week_key", "")),
+            "date": clean_text(r.get("date", "")),
+            "weekday": clean_text(r.get("weekday", "")),
+            "day": day,
+            "name": name,
+            "price": clean_text(r.get("price", "")),
+            "kcal": safe_float(r.get("kcal", 0)),
+            "protein": safe_float(r.get("protein", 0)),
+            "carbs": safe_float(r.get("carbs", 0)),
+            "fat": safe_float(r.get("fat", 0)),
+            "fiber": safe_float(r.get("fiber", 0)),
+            "note": clean_text(r.get("note", "")),
+        }
+        if not rec["date"]:
+            m = re.search(r"(20\d{2}-\d{2}-\d{2})", day)
+            if m:
+                rec["date"] = m.group(1)
+        out.append(rec)
     return out
 
 
-def make_chatgpt_prompt(rows: List[MenuDish]) -> str:
-    compact = [
-        {"day": r.day, "name": r.name, "price": r.price, "local_rough_estimate": display_macro_from_obj(r)}
-        for r in rows
-    ]
-    return (
-        "请你根据下面的德国学生食堂一周菜单，逐个菜名估算一份普通食堂份量的营养成分。\n"
-        "要求：\n"
-        "1. 不要只按食物大类粗略归类；请根据菜名里的具体食材、常见德国/欧洲食堂做法、类似菜谱营养数据来估算。\n"
-        "2. 单位：kcal 为千卡；protein/carbs/fat/fiber 为克；co2e_g 为克 CO2e。\n"
-        "3. CO2e 只作为内部参考字段，不要写在菜名后面，不要额外解释每个菜的 CO2。\n"
-        "4. 输出必须是 JSON 数组，不要 markdown，不要代码块，不要中文表格。\n"
-        "5. 每个元素必须包含这些字段：day, name, price, kcal, protein, carbs, fat, fiber, co2e_g, note。\n"
-        "6. note 简短写估算依据，例如：鸡胸+土豆球+酱汁，普通Mensa一份。\n\n"
-        "菜单数据：\n"
-        + json.dumps(compact, ensure_ascii=False, indent=2)
+def save_menu_rows(conn: sqlite3.Connection, week_key: str, rows: List[Dict[str, object]], replace: bool = True) -> int:
+    if replace:
+        conn.execute("DELETE FROM menu_items WHERE week_key=?", (week_key,))
+    now = datetime.now().isoformat(timespec="seconds")
+    count = 0
+    for r in rows:
+        wk = clean_text(r.get("week_key", "")) or week_key
+        conn.execute(
+            """
+            INSERT INTO menu_items
+            (week_key, date, weekday, day, name, price, kcal, protein, carbs, fat, fiber, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                wk, clean_text(r.get("date", "")), clean_text(r.get("weekday", "")), clean_text(r.get("day", "")),
+                clean_text(r.get("name", "")), clean_text(r.get("price", "")), safe_float(r.get("kcal", 0)),
+                safe_float(r.get("protein", 0)), safe_float(r.get("carbs", 0)), safe_float(r.get("fat", 0)),
+                safe_float(r.get("fiber", 0)), clean_text(r.get("note", "")), now,
+            ),
+        )
+        count += 1
+    conn.commit()
+    return count
+
+
+def get_menu_rows(conn: sqlite3.Connection, week_key: str) -> List[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, week_key, date, weekday, day, name, price, kcal, protein, carbs, fat, fiber, note
+        FROM menu_items WHERE week_key=?
+        ORDER BY COALESCE(date, day), id
+        """,
+        (week_key,),
+    ).fetchall()
+
+
+def add_daily_record(conn: sqlite3.Connection, record_date: str, meal: str, name: str, grams: float, macro: Dict[str, float], note: str = "") -> None:
+    conn.execute(
+        """
+        INSERT INTO daily_records
+        (record_date, meal, name, grams, kcal, protein, carbs, fat, fiber, note, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record_date, meal, name, grams, macro["kcal"], macro["protein"], macro["carbs"],
+            macro["fat"], macro["fiber"], note, datetime.now().isoformat(timespec="seconds"),
+        ),
     )
+    conn.commit()
 
 
-def rerun() -> None:
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
+def get_daily_records(conn: sqlite3.Connection, record_date: str) -> List[sqlite3.Row]:
+    return conn.execute("SELECT * FROM daily_records WHERE record_date=? ORDER BY id", (record_date,)).fetchall()
 
 
-def render_metric_row(total: Dict[str, float], target: Optional[Dict[str, float]] = None) -> None:
-    c1, c2, c3, c4, c5 = st.columns(5)
-    data = [("kcal", "热量"), ("protein", "蛋白 g"), ("carbs", "碳水 g"), ("fat", "脂肪 g"), ("fiber", "纤维 g")]
-    cols = [c1, c2, c3, c4, c5]
-    for col, (key, label) in zip(cols, data):
+def delete_daily_record(conn: sqlite3.Connection, rec_id: int) -> None:
+    conn.execute("DELETE FROM daily_records WHERE id=?", (int(rec_id),))
+    conn.commit()
+
+
+def daily_total(rows: Iterable[sqlite3.Row]) -> Dict[str, float]:
+    return sum_macros(macro_from_row(r) for r in rows)
+
+
+def dataframe_csv(df: pd.DataFrame) -> str:
+    return df.to_csv(index=False, encoding="utf-8-sig")
+
+
+def render_macro_metrics(total: Dict[str, float], target: Optional[Dict[str, float]] = None) -> None:
+    labels = [("kcal", "kcal"), ("protein", "蛋白"), ("carbs", "碳水"), ("fat", "脂肪"), ("fiber", "纤维")]
+    cols = st.columns(len(labels))
+    for col, (key, label) in zip(cols, labels):
+        val = total.get(key, 0.0)
         if target and key in target:
-            delta = total.get(key, 0) - target[key]
-            col.metric(label, f"{total.get(key, 0):.0f}", f"{delta:+.0f}")
+            col.metric(label, f"{val:.0f}", f"{val - target[key]:+.0f}")
         else:
-            col.metric(label, f"{total.get(key, 0):.0f}")
+            col.metric(label, f"{val:.0f}")
 
 
-def df_from_rows(rows: Iterable[sqlite3.Row | Dict[str, object]], fields: List[str]) -> pd.DataFrame:
-    return pd.DataFrame([{f: row_value(r, f, "") for f in fields} for r in rows])
+def week_start(d: date) -> date:
+    return d - timedelta(days=d.weekday())
 
 
-def parse_date_string(s: str) -> Optional[date]:
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        return None
-
-
-def get_daily_summary(conn: sqlite3.Connection, start: str, end: str) -> pd.DataFrame:
+def render_summary(conn: sqlite3.Connection) -> None:
+    st.subheader("历史/周月总结")
+    mode = st.radio("范围", ["本周", "本月", "自定义"], horizontal=True)
+    today = date.today()
+    if mode == "本周":
+        start = week_start(today)
+        end = start + timedelta(days=6)
+    elif mode == "本月":
+        start = today.replace(day=1)
+        next_month = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+        end = next_month - timedelta(days=1)
+    else:
+        c1, c2 = st.columns(2)
+        start = c1.date_input("开始日期", value=week_start(today), key="sum_start")
+        end = c2.date_input("结束日期", value=today, key="sum_end")
     rows = conn.execute(
         """
         SELECT record_date, SUM(kcal) AS kcal, SUM(protein) AS protein, SUM(carbs) AS carbs,
-               SUM(fat) AS fat, SUM(fiber) AS fiber, SUM(co2e_g) AS co2e_g
+               SUM(fat) AS fat, SUM(fiber) AS fiber
         FROM daily_records
         WHERE record_date BETWEEN ? AND ?
         GROUP BY record_date
         ORDER BY record_date
         """,
-        (start, end),
+        (start.isoformat(), end.isoformat()),
     ).fetchall()
-    return df_from_rows(rows, ["record_date", "kcal", "protein", "carbs", "fat", "fiber", "co2e_g"])
-
-
-def upsert_weight(conn: sqlite3.Connection, week_key: str, record_date: str, weight_kg: float, waist_cm: float, note: str) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
-    conn.execute(
-        """
-        INSERT INTO weekly_weights (week_key, record_date, weight_kg, waist_cm, note, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(week_key) DO UPDATE SET
-            record_date=excluded.record_date, weight_kg=excluded.weight_kg, waist_cm=excluded.waist_cm,
-            note=excluded.note, created_at=excluded.created_at
-        """,
-        (week_key, record_date, weight_kg, waist_cm, note, now),
-    )
-    conn.commit()
-
-
-def get_weights(conn: sqlite3.Connection) -> List[sqlite3.Row]:
-    return conn.execute("SELECT * FROM weekly_weights ORDER BY week_key").fetchall()
-
-
-def make_recommendation(summary_df: pd.DataFrame, weights: List[sqlite3.Row], target: Dict[str, float], body: Dict[str, float]) -> List[str]:
-    advice = []
-    if summary_df.empty:
-        return ["还没有足够的每日记录。先连续记录 7 天，再判断是否需要调整摄入。"]
-    avg_kcal = float(summary_df["kcal"].mean()) if "kcal" in summary_df else 0
-    avg_p = float(summary_df["protein"].mean()) if "protein" in summary_df else 0
-    advice.append(f"当前统计区间平均摄入约 {avg_kcal:.0f} kcal/天，蛋白约 {avg_p:.0f} g/天。")
-    if avg_p < target.get("protein", 190) - 15:
-        advice.append("蛋白明显低于目标：优先补到 180–190 g/天，再考虑调碳水或脂肪。")
-    elif avg_p >= target.get("protein", 190) - 5:
-        advice.append("蛋白基本达标：继续保持。")
-
-    valid_weights = [w for w in weights if row_value(w, "weight_kg", 0)]
-    if len(valid_weights) >= 2:
-        last = float(valid_weights[-1]["weight_kg"])
-        prev = float(valid_weights[-2]["weight_kg"])
-        delta = last - prev
-        advice.append(f"最近两次周体重变化：{delta:+.2f} kg。")
-        if delta > -0.2:
-            advice.append("体重下降偏慢或上升：下周每日平均热量可减少 150–200 kcal，优先从脂肪和精制碳水中减。")
-        elif delta < -1.0:
-            advice.append("体重下降过快：训练日可增加 100–150 kcal，避免训练表现下降。")
-        else:
-            advice.append("体重下降速度合理：维持当前摄入结构一周再评估。")
-    else:
-        advice.append("体重数据不足：建议每周固定一天早晨空腹记录体重。")
-
-    target_weight = body.get("target_weight", 85.0)
-    current_weight = body.get("current_weight", 0) or (float(valid_weights[-1]["weight_kg"]) if valid_weights else 0)
-    if current_weight and current_weight <= target_weight:
-        advice.append("当前体重已接近或低于目标体重：可以考虑从减脂期切换到维持/小幅增肌阶段。")
-    return advice
-
-
-def render_menu_import_tab(conn: sqlite3.Connection, week_key: str) -> None:
-    st.subheader("导入网页菜单 → 生成 ChatGPT 估算提示 → 导入结果")
-    st.info("食物数据库保持本地手动维护；这里的 ChatGPT 流程只用于一周 Mensa 菜单估算。App 不调用 API，你把提示词复制到 ChatGPT，再把 JSON/CSV 粘贴回来即可。")
-
-    source_mode = st.radio("菜单导入方式", ["URL", "上传 HTML/TXT", "粘贴网页文本"], horizontal=True)
-    if source_mode == "URL":
-        url = st.text_input("Mensa URL", value=DEFAULT_URL)
-        if st.button("抓取 URL 并解析", type="primary"):
-            try:
-                st.session_state["raw_menu_text"] = fetch_url_text(url)
-                st.success("URL 抓取成功。")
-            except Exception as e:
-                st.error(f"抓取失败：{e}")
-    elif source_mode == "上传 HTML/TXT":
-        file = st.file_uploader("上传浏览器保存的网页 HTML 或 TXT", type=["html", "htm", "txt"])
-        if file is not None:
-            st.session_state["raw_menu_text"] = file.read().decode("utf-8", errors="replace")
-            st.success("文件读取成功。")
-    else:
-        pasted = st.text_area("粘贴网页文本/HTML", height=220)
-        if st.button("使用粘贴文本"):
-            st.session_state["raw_menu_text"] = pasted
-            st.success("已载入粘贴内容。")
-
-    raw_loaded = st.session_state.get("raw_menu_text", "")
-    if not raw_loaded:
+    if not rows:
+        st.info("这个范围没有记录。")
         return
-
-    local_rows = parse_menu_from_text(raw_loaded, week_key)
-    st.write(f"已解析到 **{len(local_rows)}** 个菜品。")
-    if not local_rows:
-        st.warning("没有解析到菜品。可以尝试复制网页的纯文本，或上传 HTML 文件。")
-        return
-
-    parsed_df = pd.DataFrame([{"day": r.day, "name": r.name, "price": r.price} for r in local_rows])
-    st.dataframe(parsed_df, use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("### A. 生成给 ChatGPT 的提示词")
-    prompt = make_chatgpt_prompt(local_rows)
-    st.text_area("复制下面内容到 ChatGPT，让它返回 JSON 数组", value=prompt, height=320)
-    st.caption("ChatGPT 返回后，复制完整 JSON 或 CSV 到下面的导入框。")
-
-    st.divider()
-    st.markdown("### B. 导入 ChatGPT 返回结果")
-    result_text = st.text_area("粘贴 ChatGPT 返回的 JSON/CSV", height=260, placeholder='例如 [{"day":"Montag", "name":"...", "kcal":650, ...}]')
-    uploaded_result = st.file_uploader("或上传 ChatGPT 结果 CSV/JSON", type=["csv", "json", "txt"], key="gpt_result_upload")
-    if uploaded_result is not None:
-        result_text = uploaded_result.read().decode("utf-8", errors="replace")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("预览 ChatGPT 结果"):
-            try:
-                parsed = parse_chatgpt_menu_result(result_text, week_key)
-                st.session_state["parsed_gpt_menu"] = parsed
-                st.success(f"解析成功：{len(parsed)} 个菜品。")
-            except Exception as e:
-                st.error(f"解析失败：{e}")
-    with c2:
-        if st.button("保存 ChatGPT 结果为本周菜单", type="primary"):
-            try:
-                parsed = parse_chatgpt_menu_result(result_text, week_key)
-                if not parsed:
-                    st.error("没有可保存的菜品。")
-                else:
-                    save_week_menu(conn, week_key, parsed, replace=True)
-                    st.success(f"已保存 {len(parsed)} 个菜品到 {week_key}。")
-                    rerun()
-            except Exception as e:
-                st.error(f"保存失败：{e}")
-
-    parsed_preview = st.session_state.get("parsed_gpt_menu")
-    if parsed_preview:
-        st.dataframe(pd.DataFrame([{"day": r.day, "name": r.name, "price": r.price, **display_macro_from_obj(r), "note": r.note} for r in parsed_preview]), use_container_width=True, hide_index=True)
-
-    st.divider()
-    with st.expander("仅作为备用：保存本地粗估结果"):
-        st.warning("这只是按关键词粗估，不推荐作为最终菜单数据。")
-        if st.button("保存本地粗估到本周菜单"):
-            save_week_menu(conn, week_key, local_rows, replace=True)
-            st.success("已保存本地粗估。")
-            rerun()
+    df = pd.DataFrame([dict(r) for r in rows])
+    st.dataframe(df, use_container_width=True)
+    avg = {k: df[k].mean() for k in MACRO_KEYS if k in df.columns}
+    st.write("平均每日摄入")
+    render_macro_metrics(avg)
+    st.line_chart(df.set_index("record_date")[["kcal", "protein", "carbs", "fat"]])
+    st.download_button("导出范围汇总 CSV", dataframe_csv(df), file_name=f"summary_{start}_{end}.csv", mime="text/csv")
 
 
-def render_week_menu_tab(conn: sqlite3.Connection, week_key: str, record_date: str) -> None:
-    st.subheader(f"本周菜单：{week_key}")
-    menu_rows = get_week_menu(conn, week_key)
-    if not menu_rows:
-        st.warning("还没有本周菜单。先到“导入菜单/ChatGPT结果”页保存。")
-        return
+def render_food_database(conn: sqlite3.Connection) -> None:
+    st.subheader("食物数据库：原处编辑，自动保存")
+    st.caption("修改名称、kcal、蛋白、碳水、脂肪、纤维、类别或拼音首字母后，按 Enter 或单击其他格/空白处触发表格提交；App 会自动写入 SQLite。删除和复制需勾选后点击按钮，避免误操作。")
 
-    csv_text = rows_to_csv(menu_rows, ["day", "name", "price", *DISPLAY_MACRO_KEYS, "co2e_g", "note"])
-    st.download_button("导出本周菜单 CSV", csv_text, file_name=f"mensa_menu_{week_key}.csv", mime="text/csv")
-
-    days = ["全部"] + sorted({r["day"] for r in menu_rows})
-    day_filter = st.selectbox("按日期筛选", days)
-    rows_show = [r for r in menu_rows if day_filter == "全部" or r["day"] == day_filter]
-
-    for r in rows_show:
-        cols = st.columns([4, 0.8, 0.8, 0.8, 0.8, 0.8, 1.0, 1.2])
-        cols[0].markdown(f"**{r['name']}**  \n{r['day']} · {r['price']}")
-        cols[1].write(f"{r['kcal']:.0f} kcal")
-        cols[2].write(f"P {r['protein']:.0f}")
-        cols[3].write(f"C {r['carbs']:.0f}")
-        cols[4].write(f"F {r['fat']:.0f}")
-        cols[5].write(f"纤维 {r['fiber']:.0f}")
-        meal = cols[6].selectbox("餐次", ["午餐", "晚餐", "早餐", "加餐"], key=f"meal_menu_{r['id']}")
-        if cols[7].button("加入当天", key=f"add_menu_{r['id']}"):
-            add_record(conn, record_date, meal, r["name"], 1.0, macro_from_obj(r))
-            st.success("已加入当天记录。")
-            rerun()
-        if row_value(r, "note", ""):
-            st.caption(f"估算依据：{r['note']}")
-        st.markdown("---")
-
-    st.subheader("编辑/删除本周菜单项")
-    options = {f"ID {r['id']} | {r['day']} | {r['name'][:50]}": int(r["id"]) for r in menu_rows}
-    selected_label = st.selectbox("选择要编辑的菜品", list(options.keys()))
-    item_id = options[selected_label]
-    item = conn.execute("SELECT * FROM menu_items WHERE id=?", (item_id,)).fetchone()
-    if item:
-        with st.form("edit_menu_item_form"):
-            c1, c2, c3 = st.columns([1.3, 2, 0.7])
-            day = c1.text_input("日期/星期", value=str(item["day"]))
-            name = c2.text_input("菜品名称", value=str(item["name"]))
-            price = c3.text_input("价格", value=str(row_value(item, "price", "")))
-            c4, c5, c6, c7, c8, c9 = st.columns(6)
-            kcal = c4.number_input("kcal", value=float(row_value(item, "kcal", 0)))
-            protein = c5.number_input("蛋白", value=float(row_value(item, "protein", 0)))
-            carbs = c6.number_input("碳水", value=float(row_value(item, "carbs", 0)))
-            fat = c7.number_input("脂肪", value=float(row_value(item, "fat", 0)))
-            fiber = c8.number_input("纤维", value=float(row_value(item, "fiber", 0)))
-            co2e_g = c9.number_input("CO2e内部字段", value=float(row_value(item, "co2e_g", 0)))
-            note = st.text_input("估算依据/备注", value=str(row_value(item, "note", "")))
-            save_btn = st.form_submit_button("保存菜单项修改")
-            if save_btn:
-                update_menu_item(conn, item_id, {"day": clean_text(day), "name": clean_text(name), "price": clean_text(price), "kcal": kcal, "protein": protein, "carbs": carbs, "fat": fat, "fiber": fiber, "co2e_g": co2e_g, "note": clean_text(note)})
-                st.success("菜单项已保存。")
-                rerun()
-        cdel1, cdel2 = st.columns([1, 3])
-        confirm_delete = cdel1.checkbox("确认删除该菜单项")
-        if cdel2.button("删除选中菜单项", disabled=not confirm_delete):
-            delete_menu_item(conn, item_id)
-            st.success("已删除。")
-            rerun()
-
-    st.divider()
-    confirm_clear = st.checkbox(f"确认清空 {week_key} 的全部菜单")
-    if st.button("清空本周菜单", disabled=not confirm_clear):
-        delete_week_menu(conn, week_key)
-        st.success("本周菜单已清空。")
-        rerun()
-
-
-def render_daily_tab(conn: sqlite3.Connection, record_date: str, target: Dict[str, float]) -> None:
-    st.subheader(f"每天记录：{record_date}")
-    records = get_record_rows(conn, record_date)
-    total = total_for_records(records)
-    render_metric_row(total, target)
-
-    if records:
-        rec_csv = rows_to_csv(records, ["record_date", "meal", "name", "grams", *DISPLAY_MACRO_KEYS, "co2e_g"])
-        st.download_button("导出当天记录 CSV", rec_csv, file_name=f"daily_record_{record_date}.csv", mime="text/csv")
-        for r in records:
-            cols = st.columns([0.8, 3, 0.8, 0.9, 0.8, 0.8, 0.8, 0.8, 0.8])
-            cols[0].write(r["meal"])
-            cols[1].write(r["name"])
-            cols[2].write(f"{r['grams']:.0f}" if r["grams"] else "-")
-            cols[3].write(f"{r['kcal']:.0f} kcal")
-            cols[4].write(f"P {r['protein']:.0f}")
-            cols[5].write(f"C {r['carbs']:.0f}")
-            cols[6].write(f"F {r['fat']:.0f}")
-            cols[7].write(f"纤维 {r['fiber']:.0f}")
-            if cols[8].button("删除", key=f"del_rec_{r['id']}"):
-                delete_record(conn, int(r["id"]))
-                rerun()
-        confirm_clear = st.checkbox("确认清空当天记录")
-        if st.button("清空当天记录", disabled=not confirm_clear):
-            clear_day_records(conn, record_date)
-            st.success("当天记录已清空。")
-            rerun()
-    else:
-        st.info("当天还没有记录。可以从“本周菜单”加入，或下面从食物库添加。")
-
-    st.divider()
-    st.subheader("蛋白不足时加入 40g 乳清")
-    protein_short = max(0.0, target["protein"] - total.get("protein", 0.0))
-    st.write(f"当前蛋白缺口：**{protein_short:.0f} g**")
-    whey = conn.execute("SELECT * FROM foods WHERE name=?", ("乳清蛋白粉",)).fetchone()
-    if st.button("如果蛋白不足，加入 40g 乳清"):
-        if protein_short <= 0:
-            st.info("当前蛋白已经达到目标，不需要加入乳清。")
-        elif whey is None:
-            st.error("数据库里没有“乳清蛋白粉”。可以在食物数据库中手动添加。")
-        else:
-            add_record(conn, record_date, "加餐", "乳清蛋白粉", 40, scale_food(whey, 40))
-            st.success("已加入 40g 乳清蛋白粉。")
-            rerun()
-
-    st.divider()
-    st.subheader("从食物数据库添加")
-    q = st.text_input("搜索食物：中文/英文/德文/拼音首字母", placeholder="例如 sjxr, ymp, rqdbf, Magerquark")
-    foods = get_foods(conn, q)
-    meal_food = st.selectbox("餐次", ["晚餐", "早餐", "午餐", "加餐"], key="meal_food")
-    grams = st.number_input("克数", min_value=0.0, value=100.0, step=10.0)
-    for f in foods[:50]:
-        cols = st.columns([0.6, 3, 1, 1, 1, 1, 1, 1])
-        cols[0].write(f"ID {f['id']}")
-        cols[1].write(f"**{f['name']}** · {f['category']} · {f['initials']}")
-        macro = scale_food(f, grams)
-        cols[2].write(f"{macro['kcal']:.0f} kcal")
-        cols[3].write(f"P {macro['protein']:.0f}")
-        cols[4].write(f"C {macro['carbs']:.0f}")
-        cols[5].write(f"F {macro['fat']:.0f}")
-        cols[6].write(f"纤维 {macro['fiber']:.0f}")
-        if cols[7].button("添加", key=f"add_food_{f['id']}"):
-            add_record(conn, record_date, meal_food, f["name"], grams, macro)
-            st.success("已添加。")
-            rerun()
-
-
-def render_food_db_tab(conn: sqlite3.Connection) -> None:
-    st.subheader("食物数据库：本地手动维护")
-    st.caption("这部分不联网。默认食物也可以删除；删除后不会自动恢复，除非你点击“清空并恢复默认食物”。")
-
-    q = st.text_input("搜索数据库", key="db_search", placeholder="名称、类别、拼音首字母、备注")
-    foods = get_foods(conn, q)
-    table_df = df_from_rows(foods, ["id", "name", "kcal", "protein", "carbs", "fat", "fiber", "category", "initials", "note"])
-    st.dataframe(table_df, use_container_width=True, hide_index=True)
-
-    c_fix1, c_fix2 = st.columns([1, 2])
-    if c_fix1.button("更新现有默认食物为核实值"):
-        n = update_existing_default_food_values(conn)
-        meta_set(conn, "default_food_values_version", DEFAULT_FOODS_VERSION)
-        st.success(f"已更新 {n} 条仍然存在且名称匹配的默认食物。不会恢复已删除项目。")
-        rerun()
-    c_fix2.caption(f"默认食物数值版本：{DEFAULT_FOODS_VERSION}")
-
-    st.divider()
-    st.markdown("### 新增食物")
-    with st.form("add_food_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns([2, 1, 1])
-        name = c1.text_input("名称")
-        category = c2.text_input("类别", value="custom")
-        initials = c3.text_input("拼音首字母/缩写")
-        c4, c5, c6, c7, c8 = st.columns(5)
-        kcal = c4.number_input("kcal/100g", value=100.0)
-        protein = c5.number_input("蛋白/100g", value=0.0)
-        carbs = c6.number_input("碳水/100g", value=0.0)
-        fat = c7.number_input("脂肪/100g", value=0.0)
-        fiber = c8.number_input("纤维/100g", value=0.0)
-        co2e_g = 0.0
-        note = st.text_input("备注")
-        submitted = st.form_submit_button("添加食物")
-        if submitted:
-            if not clean_text(name):
-                st.error("名称不能为空。")
-            else:
-                try:
-                    insert_food(conn, {"name": clean_text(name), "kcal": kcal, "protein": protein, "carbs": carbs, "fat": fat, "fiber": fiber, "co2e_g": co2e_g, "category": clean_text(category), "initials": clean_text(initials).lower(), "note": clean_text(note)})
-                    st.success("食物已添加。")
-                    rerun()
-                except sqlite3.IntegrityError:
-                    st.error("名称已存在。请改名，或在下面选择该食物进行编辑。")
-
-    st.divider()
-    st.markdown("### 编辑 / 复制 / 删除食物")
-    all_foods = get_foods(conn, "")
-    if not all_foods:
-        st.info("食物库为空。可以新增食物，或点击下方恢复默认食物。")
-    else:
-        options = {f"ID {f['id']} | {f['name']}": int(f["id"]) for f in all_foods}
-        label = st.selectbox("选择食物", list(options.keys()), key="food_edit_selector")
-        food_id = options[label]
-        food = get_food_by_id(conn, food_id)
-        if food:
-            with st.form("edit_food_form"):
-                c1, c2, c3 = st.columns([2, 1, 1])
-                name_e = c1.text_input("名称", value=str(food["name"]))
-                category_e = c2.text_input("类别", value=str(row_value(food, "category", "custom")))
-                initials_e = c3.text_input("拼音首字母/缩写", value=str(row_value(food, "initials", "")))
-                c4, c5, c6, c7, c8 = st.columns(5)
-                kcal_e = c4.number_input("kcal/100g", value=float(row_value(food, "kcal", 0)), key="edit_kcal")
-                protein_e = c5.number_input("蛋白/100g", value=float(row_value(food, "protein", 0)), key="edit_p")
-                carbs_e = c6.number_input("碳水/100g", value=float(row_value(food, "carbs", 0)), key="edit_c")
-                fat_e = c7.number_input("脂肪/100g", value=float(row_value(food, "fat", 0)), key="edit_f")
-                fiber_e = c8.number_input("纤维/100g", value=float(row_value(food, "fiber", 0)), key="edit_fiber")
-                co2_e = float(row_value(food, "co2e_g", 0))
-                note_e = st.text_input("备注", value=str(row_value(food, "note", "")))
-                saved = st.form_submit_button("保存修改")
-                if saved:
-                    if not clean_text(name_e):
-                        st.error("名称不能为空。")
-                    else:
-                        try:
-                            update_food_by_id(conn, food_id, {"name": clean_text(name_e), "kcal": kcal_e, "protein": protein_e, "carbs": carbs_e, "fat": fat_e, "fiber": fiber_e, "co2e_g": co2_e, "category": clean_text(category_e), "initials": clean_text(initials_e).lower(), "note": clean_text(note_e)})
-                            st.success("修改已保存。")
-                            rerun()
-                        except sqlite3.IntegrityError:
-                            st.error("该名称已被其他食物使用。请换一个名称。")
-            c1, c2, c3 = st.columns(3)
-            if c1.button("复制选中食物"):
-                new_id = copy_food_by_id(conn, food_id)
-                st.success(f"已复制，新 ID：{new_id}")
-                rerun()
-            confirm_del = c2.checkbox("确认删除", key=f"confirm_food_delete_{food_id}")
-            if c3.button("删除选中食物", disabled=not confirm_del):
-                delete_food_by_id(conn, food_id)
-                st.success("已删除。")
-                rerun()
-
-    st.divider()
-    st.markdown("### 批量导入食物 CSV/TXT")
-    st.caption("支持逗号、分号、Tab 分隔。建议列名：name,kcal,protein,carbs,fat,fiber,category,initials,note。已有名称不会覆盖，避免误改；需要修改请用上方编辑表单。")
-    upload = st.file_uploader("上传食物 CSV/TXT", type=["csv", "txt", "tsv"], key="food_bulk_upload")
-    if upload is not None and st.button("导入上传的食物"):
-        text = upload.read().decode("utf-8", errors="replace")
-        try:
-            dialect = csv.Sniffer().sniff(text[:2048], delimiters=",;\t|")
-        except Exception:
-            dialect = csv.excel_tab if "\t" in text[:200] else csv.excel
-        reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-        added, skipped = 0, 0
-        for r in reader:
-            name = clean_text(str(map_value(r, ["name", "名称", "food", "食物"], "")))
-            if not name or "?" in name:
-                skipped += 1
-                continue
-            vals = {
-                "name": name,
-                "kcal": safe_float(map_value(r, ["kcal", "kcal/100g", "热量"], 0)),
-                "protein": safe_float(map_value(r, ["protein", "p", "P", "蛋白"], 0)),
-                "carbs": safe_float(map_value(r, ["carbs", "c", "C", "碳水"], 0)),
-                "fat": safe_float(map_value(r, ["fat", "f", "F", "脂肪"], 0)),
-                "fiber": safe_float(map_value(r, ["fiber", "纤维"], 0)),
-                "co2e_g": safe_float(map_value(r, ["co2e_g", "co2e", "CO?e/100g", "CO2e/100g"], 0)),
-                "category": clean_text(str(map_value(r, ["category", "类别"], "custom"))),
-                "initials": clean_text(str(map_value(r, ["initials", "首字母", "拼音"], ""))).lower(),
-                "note": clean_text(str(map_value(r, ["note", "备注"], "批量导入"))),
-            }
-            try:
-                insert_food(conn, vals)
-                added += 1
-            except sqlite3.IntegrityError:
-                skipped += 1
-        st.success(f"导入完成：新增 {added} 条，跳过 {skipped} 条。")
-        rerun()
-
-    st.divider()
-    confirm_reset = st.checkbox("确认清空全部食物并恢复默认食物")
-    if st.button("清空并恢复默认食物", disabled=not confirm_reset):
-        reset_default_foods(conn)
-        st.success("已恢复默认食物库。")
-        rerun()
-
-
-def render_history_tab(conn: sqlite3.Connection, target: Dict[str, float]) -> None:
-    st.subheader("历史记录 / 周月总结 / 每周体重")
-    today = date.today()
-    mode = st.radio("统计范围", ["本周", "本月", "自定义"], horizontal=True)
-    if mode == "本周":
-        start_date = today - timedelta(days=today.weekday())
-        end_date = start_date + timedelta(days=6)
-    elif mode == "本月":
-        start_date = today.replace(day=1)
-        next_month = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
-        end_date = next_month - timedelta(days=1)
-    else:
-        c1, c2 = st.columns(2)
-        start_date = c1.date_input("开始日期", value=today - timedelta(days=30), key="hist_start")
-        end_date = c2.date_input("结束日期", value=today, key="hist_end")
-
-    df = get_daily_summary(conn, start_date.isoformat(), end_date.isoformat())
-    st.write(f"统计区间：{start_date.isoformat()} 至 {end_date.isoformat()}")
+    q = st.text_input("搜索：中文 / 德文 / 英文 / 拼音首字母", key="food_editor_search", placeholder="例如 sjxr, rqdbf, Magerquark")
+    df = foods_df(conn, q)
     if df.empty:
-        st.info("这个区间还没有每日记录。")
+        st.info("没有匹配食物。")
     else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        avg = {k: float(df[k].mean()) for k in ["kcal", "protein", "carbs", "fat", "fiber"] if k in df}
-        render_metric_row(avg, target)
-        chart_df = df.set_index("record_date")[["kcal", "protein", "carbs", "fat"]]
-        st.line_chart(chart_df)
-        st.download_button("导出汇总 CSV", df.to_csv(index=False), file_name="nutrition_summary.csv", mime="text/csv")
+        edited = st.data_editor(
+            df,
+            key="foods_editor_v7",
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            disabled=["id"],
+            column_config={
+                "删除": st.column_config.CheckboxColumn("删除", help="勾选后点击下方删除按钮"),
+                "复制": st.column_config.CheckboxColumn("复制", help="勾选后点击下方复制按钮"),
+                "id": st.column_config.NumberColumn("id", disabled=True),
+                "name": st.column_config.TextColumn("名称", required=True),
+                "kcal": st.column_config.NumberColumn("kcal/100g", step=1.0, format="%.1f"),
+                "protein": st.column_config.NumberColumn("蛋白/100g", step=0.1, format="%.1f"),
+                "carbs": st.column_config.NumberColumn("碳水/100g", step=0.1, format="%.1f"),
+                "fat": st.column_config.NumberColumn("脂肪/100g", step=0.1, format="%.1f"),
+                "fiber": st.column_config.NumberColumn("纤维/100g", step=0.1, format="%.1f"),
+                "category": st.column_config.TextColumn("类别"),
+                "initials": st.column_config.TextColumn("检索首字母"),
+            },
+        )
+        changed, errors = sync_food_editor(conn, edited)
+        if changed:
+            st.toast(f"已自动保存 {changed} 行修改", icon="✅")
+        for e in errors:
+            st.error(e)
+
+        c1, c2, c3 = st.columns([1, 1, 2])
+        del_ids = edited.loc[edited["删除"] == True, "id"].dropna().astype(int).tolist() if "删除" in edited.columns else []
+        copy_ids = edited.loc[edited["复制"] == True, "id"].dropna().astype(int).tolist() if "复制" in edited.columns else []
+        if c1.button(f"删除勾选行 ({len(del_ids)})", disabled=len(del_ids) == 0, type="secondary"):
+            n = delete_food_ids(conn, del_ids)
+            st.success(f"已删除 {n} 个食物。")
+            st.rerun()
+        if c2.button(f"复制勾选行 ({len(copy_ids)})", disabled=len(copy_ids) == 0):
+            n = copy_food_ids(conn, copy_ids)
+            st.success(f"已复制 {n} 个食物。")
+            st.rerun()
+        if c3.button("刷新表格"):
+            st.rerun()
 
     st.divider()
-    st.markdown("### 每周体重记录")
-    with st.form("weight_form"):
-        c1, c2, c3, c4 = st.columns(4)
-        w_date = c1.date_input("测量日期", value=today)
-        w_key = c2.text_input("周编号", value=week_key_from_date(w_date))
-        weight_kg = c3.number_input("体重 kg", min_value=0.0, value=0.0, step=0.1)
-        waist_cm = c4.number_input("腰围 cm，可选", min_value=0.0, value=0.0, step=0.5)
-        note = st.text_input("备注")
-        if st.form_submit_button("保存/更新本周体重"):
-            if weight_kg <= 0:
-                st.error("体重必须大于 0。")
-            else:
-                upsert_weight(conn, clean_text(w_key), w_date.isoformat(), weight_kg, waist_cm, clean_text(note))
-                st.success("体重已保存。")
-                rerun()
-
-    weights = get_weights(conn)
-    if weights:
-        st.dataframe(df_from_rows(weights, ["week_key", "record_date", "weight_kg", "waist_cm", "note"]), use_container_width=True, hide_index=True)
-        weight_df = df_from_rows(weights, ["week_key", "weight_kg"])
-        st.line_chart(weight_df.set_index("week_key"))
-    else:
-        st.info("还没有体重记录。")
+    with st.expander("新增食物", expanded=False):
+        with st.form("add_food_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input("名称")
+            category = c2.text_input("类别", value="custom")
+            initials = c3.text_input("拼音首字母/缩写")
+            c4, c5, c6, c7, c8 = st.columns(5)
+            kcal = c4.number_input("kcal/100g", value=0.0, step=1.0)
+            protein = c5.number_input("蛋白/100g", value=0.0, step=0.1)
+            carbs = c6.number_input("碳水/100g", value=0.0, step=0.1)
+            fat = c7.number_input("脂肪/100g", value=0.0, step=0.1)
+            fiber = c8.number_input("纤维/100g", value=0.0, step=0.1)
+            if st.form_submit_button("新增/按名称覆盖"):
+                try:
+                    upsert_food_by_name(conn, {"name": name, "kcal": kcal, "protein": protein, "carbs": carbs, "fat": fat, "fiber": fiber, "category": category, "initials": initials})
+                    st.success("已保存。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
 
     st.divider()
-    st.markdown("### 摄入调整建议")
-    c1, c2, c3, c4 = st.columns(4)
-    height_cm = c1.number_input("身高 cm", value=174.0, step=1.0)
-    age = c2.number_input("年龄", value=30.0, step=1.0)
-    current_weight = c3.number_input("当前体重 kg", value=float(weights[-1]["weight_kg"]) if weights else 85.0, step=0.1)
-    target_weight = c4.number_input("目标体重 kg", value=85.0, step=0.1)
-    body = {"height_cm": height_cm, "age": age, "current_weight": current_weight, "target_weight": target_weight}
-    for item in make_recommendation(df, weights, target, body):
-        st.write("- " + item)
+    st.subheader("持久化：把食物库保存进 GitHub")
+    st.warning("Streamlit Community Cloud 的本地 SQLite 文件不是长期存储。编辑后的数据请下载 foods_master.csv，然后上传/提交到 GitHub 仓库根目录。下次部署或重启后，App 会用仓库里的 foods_master.csv 初始化食物库。")
+    current_csv = all_foods_as_csv(conn)
+    st.download_button("下载当前食物库为 foods_master.csv", current_csv, file_name="foods_master.csv", mime="text/csv")
+    uploaded = st.file_uploader("导入 foods_master.csv 并重建食物库", type=["csv"], key="food_seed_upload")
+    if uploaded is not None:
+        try:
+            text = uploaded.read().decode("utf-8-sig", errors="replace")
+            df_seed = pd.read_csv(io.StringIO(text))
+            rows = []
+            for rec in df_seed.to_dict("records"):
+                item = normalize_food_dict(rec)
+                if item:
+                    rows.append(item)
+            if st.button(f"确认用上传的 CSV 重建食物库：{len(rows)} 项", type="primary"):
+                n = rebuild_foods_from_seed(conn, rows)
+                st.success(f"已重建食物库：{n} 项。")
+                st.rerun()
+        except Exception as e:
+            st.error(f"CSV 读取失败：{e}")
+    col_a, col_b = st.columns(2)
+    if col_a.button("用 GitHub 中的 foods_master.csv 重建", disabled=not FOODS_SEED_PATH.exists()):
+        n = rebuild_foods_from_seed(conn)
+        st.success(f"已从 foods_master.csv 重建：{n} 项。")
+        st.rerun()
+    if col_b.button("清空并恢复程序内置默认食物"):
+        n = rebuild_foods_from_seed(conn, DEFAULT_FOODS)
+        st.success(f"已恢复内置默认食物：{n} 项。")
+        st.rerun()
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🍽️", layout="wide")
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("本地食物库手动维护；Mensa 菜单可先交给 ChatGPT 估算，再导入网页 App。")
-
+    st.caption(APP_VERSION)
     conn = get_conn()
     init_db(conn)
 
     with st.sidebar:
-        st.header("基础设置")
-        week_key = st.text_input("本周编号", value=current_week_key(), help="例如 2026-KW28")
+        st.header("记录设置")
+        week_key = st.text_input("本周编号", value=current_week_key(), help="例如 2026-KW28。导入菜单 CSV 里有 week_key 时也会保存。")
         record_date = st.date_input("记录日期", value=date.today()).isoformat()
         preset_name = st.selectbox("每日目标", list(TARGET_PRESETS.keys()))
         preset = TARGET_PRESETS[preset_name]
@@ -1236,28 +745,117 @@ def main() -> None:
             "carbs": st.number_input("目标碳水 g", value=float(preset["carbs"]), step=5.0),
             "fat": st.number_input("目标脂肪 g", value=float(preset["fat"]), step=1.0),
         }
-        st.caption("当前版不需要 OpenAI API key。")
 
-    tab_import, tab_week, tab_day, tab_food, tab_hist = st.tabs([
-        "1 导入菜单/ChatGPT结果",
-        "2 本周菜单",
-        "3 每天记录",
-        "4 食物数据库",
-        "5 历史/体重/建议",
-    ])
+    tab_import, tab_menu, tab_day, tab_food, tab_summary = st.tabs(["1 导入菜单结果", "2 本周菜单", "3 每天记录", "4 食物数据库", "5 历史总结"])
 
     with tab_import:
-        render_menu_import_tab(conn, week_key)
-    with tab_week:
-        render_week_menu_tab(conn, week_key, record_date)
-    with tab_day:
-        render_daily_tab(conn, record_date, target)
-    with tab_food:
-        render_food_db_tab(conn)
-    with tab_hist:
-        render_history_tab(conn, target)
+        st.subheader("导入 ChatGPT 已估算菜单 CSV/JSON")
+        st.write("推荐字段：`day,date,weekday,week_key,name,price,kcal,protein,carbs,fat,fiber,note`。`co2e_g` 可以存在，但本版不显示也不用于计算。")
+        f = st.file_uploader("上传 ChatGPT 生成的菜单 CSV 或 JSON", type=["csv", "json"])
+        if f is not None:
+            try:
+                rows = parse_imported_menu(f.read(), f.name)
+                st.success(f"识别到 {len(rows)} 条菜单。")
+                if rows:
+                    preview = pd.DataFrame(rows)
+                    st.dataframe(preview, use_container_width=True)
+                    replace = st.checkbox("替换当前 week_key 的旧菜单", value=True)
+                    if st.button("保存导入菜单", type="primary"):
+                        n = save_menu_rows(conn, week_key, rows, replace=replace)
+                        st.success(f"已保存 {n} 条菜单。")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"导入失败：{e}")
+        st.divider()
+        st.info("食堂菜单仍按你的流程：网页菜单 → 发给 ChatGPT 估算 → 生成 CSV → 上传到这里。食物数据库不联网。")
 
-    st.caption("提示：Mensa 菜品没有固定称重，营养值是估算值。减脂期建议对奶油酱、炸物、汉堡、披萨偏高估。")
+    with tab_menu:
+        st.subheader(f"本周菜单：{week_key}")
+        rows = get_menu_rows(conn, week_key)
+        if not rows:
+            st.warning("当前 week_key 没有菜单。请先导入 CSV/JSON。")
+        else:
+            df = pd.DataFrame([dict(r) for r in rows])
+            st.download_button("导出本周菜单 CSV", dataframe_csv(df), file_name=f"mensa_menu_{week_key}.csv", mime="text/csv")
+            dates = ["全部"] + sorted({clean_text(r["date"] or r["day"]) for r in rows if clean_text(r["date"] or r["day"])})
+            selected_date = st.selectbox("筛选日期", dates)
+            show_rows = [r for r in rows if selected_date == "全部" or clean_text(r["date"] or r["day"]) == selected_date]
+            for r in show_rows:
+                with st.container(border=True):
+                    c = st.columns([4, 0.8, 0.8, 0.8, 0.8, 0.8, 1.2])
+                    date_label = r["date"] or r["day"]
+                    c[0].markdown(f"**{r['name']}**  \n{date_label} {r['weekday'] or ''} · {r['price'] or ''}  \n{r['note'] or ''}")
+                    c[1].metric("kcal", f"{r['kcal']:.0f}")
+                    c[2].metric("P", f"{r['protein']:.0f}")
+                    c[3].metric("C", f"{r['carbs']:.0f}")
+                    c[4].metric("F", f"{r['fat']:.0f}")
+                    c[5].metric("纤维", f"{r['fiber']:.0f}")
+                    with c[6]:
+                        meal = st.selectbox("餐次", ["午餐", "晚餐", "早餐", "加餐"], key=f"meal_menu_{r['id']}")
+                        if st.button("加入当天", key=f"add_menu_{r['id']}"):
+                            add_daily_record(conn, record_date, meal, r["name"], 1.0, macro_from_row(r), f"Mensa {week_key}")
+                            st.success("已加入当天记录。")
+                            st.rerun()
+
+    with tab_day:
+        st.subheader(f"每天记录：{record_date}")
+        records = get_daily_records(conn, record_date)
+        total = daily_total(records)
+        render_macro_metrics(total, target)
+        if records:
+            rec_df = pd.DataFrame([dict(r) for r in records])
+            st.download_button("导出当天记录 CSV", dataframe_csv(rec_df), file_name=f"daily_record_{record_date}.csv", mime="text/csv")
+            for r in records:
+                c = st.columns([1, 3, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8])
+                c[0].write(r["meal"])
+                c[1].write(r["name"])
+                c[2].write(f"{r['grams']:.0f}" if r["grams"] else "-")
+                c[3].write(f"{r['kcal']:.0f} kcal")
+                c[4].write(f"P {r['protein']:.0f}")
+                c[5].write(f"C {r['carbs']:.0f}")
+                c[6].write(f"F {r['fat']:.0f}")
+                if c[7].button("删除", key=f"del_rec_{r['id']}"):
+                    delete_daily_record(conn, int(r["id"]))
+                    st.rerun()
+        else:
+            st.info("当天没有记录。")
+
+        st.divider()
+        st.subheader("从食物数据库添加")
+        fq = st.text_input("搜索食物", placeholder="例如 sjxr, rqdbf, Magerquark", key="add_food_search")
+        food_df = foods_df(conn, fq).drop(columns=["删除", "复制"], errors="ignore")
+        meal = st.selectbox("餐次", ["晚餐", "早餐", "午餐", "加餐"], key="meal_food_add")
+        grams = st.number_input("克数", value=100.0, min_value=0.0, step=10.0)
+        for _, frow in food_df.head(40).iterrows():
+            c = st.columns([3, 0.8, 0.8, 0.8, 0.8, 1])
+            macro = scale_food(frow.to_dict(), grams)
+            c[0].write(f"**{frow['name']}** · {frow['category']} · {frow['initials']}")
+            c[1].write(f"{macro['kcal']:.0f} kcal")
+            c[2].write(f"P {macro['protein']:.0f}")
+            c[3].write(f"C {macro['carbs']:.0f}")
+            c[4].write(f"F {macro['fat']:.0f}")
+            if c[5].button("添加", key=f"add_food_{int(frow['id'])}"):
+                add_daily_record(conn, record_date, meal, frow["name"], grams, macro, "食物数据库")
+                st.success("已添加。")
+                st.rerun()
+
+        st.divider()
+        whey = conn.execute("SELECT * FROM foods WHERE name=?", ("乳清蛋白粉",)).fetchone()
+        protein_gap = max(0.0, target["protein"] - total.get("protein", 0.0))
+        st.write(f"当前蛋白缺口：**{protein_gap:.0f} g**")
+        if st.button("蛋白不足时加入 40g 乳清", disabled=whey is None or protein_gap <= 0):
+            macro = scale_food(whey, 40)
+            add_daily_record(conn, record_date, "加餐", "乳清蛋白粉", 40, macro, "40g 乳清")
+            st.success("已加入 40g 乳清。")
+            st.rerun()
+
+    with tab_food:
+        render_food_database(conn)
+
+    with tab_summary:
+        render_summary(conn)
+
+    st.caption("说明：营养数据是估算/手动维护值。Streamlit Cloud 本地 SQLite 不保证持久，重要数据请导出 CSV 并提交到 GitHub 或接外部数据库。")
 
 
 if __name__ == "__main__":
