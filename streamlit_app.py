@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Alte Mensa 减脂营养记录器 - Streamlit v7
+Alte Mensa 减脂营养记录器 - Streamlit v8
 
 核心逻辑：
 1. 食物数据库完全本地手动维护，不联网。
@@ -28,10 +28,12 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "Alte Mensa 减脂营养记录器"
-APP_VERSION = "v7 食物库自动保存 + GitHub seed CSV"
+APP_VERSION = "v8 历史记录导入导出 + Excel中文CSV修复"
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "mensa_streamlit.sqlite3"
 FOODS_SEED_PATH = BASE_DIR / "foods_master.csv"
+DAILY_RECORDS_SEED_PATH = BASE_DIR / "daily_records_master.csv"
+WEIGHT_LOGS_SEED_PATH = BASE_DIR / "weight_logs_master.csv"
 MACRO_KEYS = ["kcal", "protein", "carbs", "fat", "fiber"]
 
 TARGET_PRESETS = {
@@ -100,6 +102,27 @@ def safe_float(x: object, default: float = 0.0) -> float:
         return float(str(x).replace(",", "."))
     except Exception:
         return default
+
+
+def decode_csv_bytes(data: bytes) -> str:
+    """Decode uploaded/downloaded CSV bytes robustly.
+
+    Excel on Windows often expects UTF-8 with BOM; older files may be GB18030/ANSI.
+    This helper keeps imports tolerant without changing internal SQLite storage.
+    """
+    for enc in ("utf-8-sig", "utf-8", "gb18030", "cp1252"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def csv_download_bytes(df: pd.DataFrame) -> bytes:
+    """Return an Excel-friendly CSV: UTF-8 with BOM, CRLF line endings."""
+    return df.to_csv(index=False, lineterminator="\r\n").encode("utf-8-sig")
+
+
 
 
 def today_str() -> str:
@@ -241,6 +264,17 @@ def init_db(conn: sqlite3.Connection) -> None:
         seed_rows = read_food_seed_file() if FOODS_SEED_PATH.exists() else DEFAULT_FOODS
         insert_food_seed(conn, seed_rows)
 
+    # Optional GitHub seed files for Streamlit Cloud persistence.
+    # If these CSVs exist in the repository and the SQLite tables are empty,
+    # load them automatically after a fresh deploy/reboot.
+    daily_count = conn.execute("SELECT COUNT(*) FROM daily_records").fetchone()[0]
+    if daily_count == 0 and DAILY_RECORDS_SEED_PATH.exists():
+        insert_daily_records(conn, read_daily_seed_file(), replace=False)
+
+    weight_count = conn.execute("SELECT COUNT(*) FROM weight_logs").fetchone()[0]
+    if weight_count == 0 and WEIGHT_LOGS_SEED_PATH.exists():
+        upsert_weight_logs(conn, read_weight_seed_file(), replace=False)
+
 
 def normalize_food_dict(d: Dict[str, object]) -> Optional[Dict[str, object]]:
     renamed = {}
@@ -292,6 +326,177 @@ def insert_food_seed(conn: sqlite3.Connection, rows: List[Dict[str, object]]) ->
     conn.commit()
 
 
+def normalize_daily_record_dict(d: Dict[str, object]) -> Optional[Dict[str, object]]:
+    renamed = {clean_text(k): v for k, v in d.items()}
+    record_date = clean_text(renamed.get("record_date", renamed.get("date", "")))
+    name = clean_text(renamed.get("name", ""))
+    meal = clean_text(renamed.get("meal", "")) or "未分类"
+    if not record_date or not name:
+        return None
+    return {
+        "record_date": record_date,
+        "meal": meal,
+        "name": name,
+        "grams": safe_float(renamed.get("grams", 0)),
+        "kcal": safe_float(renamed.get("kcal", 0)),
+        "protein": safe_float(renamed.get("protein", 0)),
+        "carbs": safe_float(renamed.get("carbs", 0)),
+        "fat": safe_float(renamed.get("fat", 0)),
+        "fiber": safe_float(renamed.get("fiber", 0)),
+        "note": clean_text(renamed.get("note", "")),
+        "created_at": clean_text(renamed.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def normalize_weight_log_dict(d: Dict[str, object]) -> Optional[Dict[str, object]]:
+    renamed = {clean_text(k): v for k, v in d.items()}
+    week_key = clean_text(renamed.get("week_key", ""))
+    log_date = clean_text(renamed.get("log_date", renamed.get("date", "")))
+    weight_kg = safe_float(renamed.get("weight_kg", renamed.get("weight", 0)))
+    if not week_key and log_date:
+        try:
+            dt = date.fromisoformat(log_date)
+            y, w, _ = dt.isocalendar()
+            week_key = f"{y}-KW{w:02d}"
+        except Exception:
+            pass
+    if not week_key or not log_date or weight_kg <= 0:
+        return None
+    return {
+        "week_key": week_key,
+        "log_date": log_date,
+        "weight_kg": weight_kg,
+        "note": clean_text(renamed.get("note", "")),
+        "created_at": clean_text(renamed.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def read_csv_records_from_bytes(data: bytes) -> List[Dict[str, object]]:
+    text = decode_csv_bytes(data)
+    reader = csv.DictReader(io.StringIO(text))
+    return [dict(r) for r in reader]
+
+
+def read_daily_seed_file() -> List[Dict[str, object]]:
+    if not DAILY_RECORDS_SEED_PATH.exists():
+        return []
+    try:
+        rows = read_csv_records_from_bytes(DAILY_RECORDS_SEED_PATH.read_bytes())
+        out = []
+        for r in rows:
+            item = normalize_daily_record_dict(r)
+            if item:
+                out.append(item)
+        return out
+    except Exception:
+        return []
+
+
+def read_weight_seed_file() -> List[Dict[str, object]]:
+    if not WEIGHT_LOGS_SEED_PATH.exists():
+        return []
+    try:
+        rows = read_csv_records_from_bytes(WEIGHT_LOGS_SEED_PATH.read_bytes())
+        out = []
+        for r in rows:
+            item = normalize_weight_log_dict(r)
+            if item:
+                out.append(item)
+        return out
+    except Exception:
+        return []
+
+
+def insert_daily_records(conn: sqlite3.Connection, rows: List[Dict[str, object]], replace: bool = False) -> int:
+    if replace:
+        conn.execute("DELETE FROM daily_records")
+    inserted = 0
+    for raw in rows:
+        item = normalize_daily_record_dict(raw)
+        if not item:
+            continue
+        exists = conn.execute(
+            """
+            SELECT 1 FROM daily_records
+            WHERE record_date=? AND meal=? AND name=? AND ABS(grams-?)<0.0001
+              AND ABS(kcal-?)<0.0001 AND ABS(protein-?)<0.0001
+              AND ABS(carbs-?)<0.0001 AND ABS(fat-?)<0.0001
+              AND ABS(fiber-?)<0.0001 AND COALESCE(note,'')=?
+            LIMIT 1
+            """,
+            (
+                item["record_date"], item["meal"], item["name"], item["grams"], item["kcal"],
+                item["protein"], item["carbs"], item["fat"], item["fiber"], item["note"],
+            ),
+        ).fetchone()
+        if exists:
+            continue
+        conn.execute(
+            """
+            INSERT INTO daily_records
+            (record_date, meal, name, grams, kcal, protein, carbs, fat, fiber, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item["record_date"], item["meal"], item["name"], item["grams"], item["kcal"],
+                item["protein"], item["carbs"], item["fat"], item["fiber"], item["note"], item["created_at"],
+            ),
+        )
+        inserted += 1
+    conn.commit()
+    return inserted
+
+
+def upsert_weight_logs(conn: sqlite3.Connection, rows: List[Dict[str, object]], replace: bool = False) -> int:
+    if replace:
+        conn.execute("DELETE FROM weight_logs")
+    changed = 0
+    for raw in rows:
+        item = normalize_weight_log_dict(raw)
+        if not item:
+            continue
+        conn.execute(
+            """
+            INSERT INTO weight_logs (week_key, log_date, weight_kg, note, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(week_key) DO UPDATE SET
+                log_date=excluded.log_date,
+                weight_kg=excluded.weight_kg,
+                note=excluded.note,
+                created_at=excluded.created_at
+            """,
+            (item["week_key"], item["log_date"], item["weight_kg"], item["note"], item["created_at"]),
+        )
+        changed += 1
+    conn.commit()
+    return changed
+
+
+def export_daily_records_df(conn: sqlite3.Connection, start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
+    sql = """
+        SELECT record_date, meal, name, grams, kcal, protein, carbs, fat, fiber, note, created_at
+        FROM daily_records
+    """
+    params: Tuple[object, ...] = ()
+    if start and end:
+        sql += " WHERE record_date BETWEEN ? AND ?"
+        params = (start, end)
+    sql += " ORDER BY record_date, id"
+    rows = conn.execute(sql, params).fetchall()
+    return pd.DataFrame([dict(r) for r in rows], columns=[
+        "record_date", "meal", "name", "grams", "kcal", "protein", "carbs", "fat", "fiber", "note", "created_at"
+    ])
+
+
+def export_weight_logs_df(conn: sqlite3.Connection) -> pd.DataFrame:
+    rows = conn.execute(
+        "SELECT week_key, log_date, weight_kg, note, created_at FROM weight_logs ORDER BY log_date, week_key"
+    ).fetchall()
+    return pd.DataFrame([dict(r) for r in rows], columns=["week_key", "log_date", "weight_kg", "note", "created_at"])
+
+
+
+
 def rebuild_foods_from_seed(conn: sqlite3.Connection, rows: Optional[List[Dict[str, object]]] = None) -> int:
     if rows is None:
         rows = read_food_seed_file() if FOODS_SEED_PATH.exists() else DEFAULT_FOODS
@@ -324,10 +529,10 @@ def foods_df(conn: sqlite3.Connection, query: str = "") -> pd.DataFrame:
     return df
 
 
-def all_foods_as_csv(conn: sqlite3.Connection) -> str:
+def all_foods_as_csv(conn: sqlite3.Connection) -> bytes:
     df = foods_df(conn, "").drop(columns=["删除", "复制"], errors="ignore")
     ordered = ["name", "kcal", "protein", "carbs", "fat", "fiber", "category", "initials"]
-    return df[ordered].to_csv(index=False, encoding="utf-8-sig")
+    return csv_download_bytes(df[ordered])
 
 
 def get_food_by_id(conn: sqlite3.Connection, food_id: int) -> Optional[sqlite3.Row]:
@@ -459,7 +664,7 @@ def upsert_food_by_name(conn: sqlite3.Connection, item: Dict[str, object]) -> No
 
 
 def parse_imported_menu(file_bytes: bytes, filename: str) -> List[Dict[str, object]]:
-    text = file_bytes.decode("utf-8-sig", errors="replace")
+    text = decode_csv_bytes(file_bytes)
     fn = filename.lower()
     rows: List[Dict[str, object]] = []
     if fn.endswith(".json") or text.strip().startswith("["):
@@ -566,8 +771,8 @@ def daily_total(rows: Iterable[sqlite3.Row]) -> Dict[str, float]:
     return sum_macros(macro_from_row(r) for r in rows)
 
 
-def dataframe_csv(df: pd.DataFrame) -> str:
-    return df.to_csv(index=False, encoding="utf-8-sig")
+def dataframe_csv(df: pd.DataFrame) -> bytes:
+    return csv_download_bytes(df)
 
 
 def render_macro_metrics(total: Dict[str, float], target: Optional[Dict[str, float]] = None) -> None:
@@ -587,6 +792,100 @@ def week_start(d: date) -> date:
 
 def render_summary(conn: sqlite3.Connection) -> None:
     st.subheader("历史/周月总结")
+
+    with st.expander("历史记录导入/导出与持久化", expanded=True):
+        st.caption("为避免 Streamlit Cloud 重启后 SQLite 丢失，建议定期导出 daily_records_master.csv 和 weight_logs_master.csv，并提交到 GitHub 仓库根目录。App 新部署且数据库为空时会自动加载这两个文件。")
+
+        all_daily = export_daily_records_df(conn)
+        all_weights = export_weight_logs_df(conn)
+        c1, c2, c3 = st.columns(3)
+        c1.download_button(
+            "下载全部每天记录 daily_records_master.csv",
+            csv_download_bytes(all_daily),
+            file_name="daily_records_master.csv",
+            mime="text/csv; charset=utf-8",
+            disabled=all_daily.empty,
+        )
+        c2.download_button(
+            "下载体重记录 weight_logs_master.csv",
+            csv_download_bytes(all_weights),
+            file_name="weight_logs_master.csv",
+            mime="text/csv; charset=utf-8",
+            disabled=all_weights.empty,
+        )
+        c3.write(f"当前记录：{len(all_daily)} 条饮食，{len(all_weights)} 条体重")
+
+        upload_daily = st.file_uploader("导入每天记录 CSV：支持 daily_records_master.csv 或 daily_record_YYYY-MM-DD.csv", type=["csv"], key="daily_records_upload")
+        if upload_daily is not None:
+            try:
+                raw_rows = read_csv_records_from_bytes(upload_daily.read())
+                rows = [x for x in (normalize_daily_record_dict(r) for r in raw_rows) if x]
+                replace_daily = st.checkbox("导入前清空已有每天记录", value=False, key="replace_daily_records")
+                if st.button(f"确认导入每天记录：{len(rows)} 条", type="primary", key="confirm_import_daily"):
+                    n = insert_daily_records(conn, rows, replace=replace_daily)
+                    st.success(f"已导入 {n} 条新记录。重复记录会自动跳过。")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"每天记录 CSV 读取失败：{e}")
+
+        upload_weight = st.file_uploader("导入体重记录 CSV：weight_logs_master.csv", type=["csv"], key="weight_logs_upload")
+        if upload_weight is not None:
+            try:
+                raw_rows = read_csv_records_from_bytes(upload_weight.read())
+                rows = [x for x in (normalize_weight_log_dict(r) for r in raw_rows) if x]
+                replace_weight = st.checkbox("导入前清空已有体重记录", value=False, key="replace_weight_logs")
+                if st.button(f"确认导入体重记录：{len(rows)} 条", type="primary", key="confirm_import_weight"):
+                    n = upsert_weight_logs(conn, rows, replace=replace_weight)
+                    st.success(f"已导入/更新 {n} 条体重记录。")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"体重记录 CSV 读取失败：{e}")
+
+        c4, c5 = st.columns(2)
+        if c4.button("从 GitHub daily_records_master.csv 加载", disabled=not DAILY_RECORDS_SEED_PATH.exists()):
+            n = insert_daily_records(conn, read_daily_seed_file(), replace=False)
+            st.success(f"已从仓库 CSV 加载 {n} 条新饮食记录。")
+            st.rerun()
+        if c5.button("从 GitHub weight_logs_master.csv 加载", disabled=not WEIGHT_LOGS_SEED_PATH.exists()):
+            n = upsert_weight_logs(conn, read_weight_seed_file(), replace=False)
+            st.success(f"已从仓库 CSV 加载/更新 {n} 条体重记录。")
+            st.rerun()
+
+    st.divider()
+    st.subheader("每周体重")
+    current_week = current_week_key()
+    with st.form("weight_log_form"):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        wk = c1.text_input("周编号", value=current_week)
+        log_dt = c2.date_input("称重日期", value=date.today(), key="weight_log_date")
+        weight = c3.number_input("体重 kg", value=0.0, min_value=0.0, step=0.1)
+        note = st.text_input("备注", value="", key="weight_note")
+        if st.form_submit_button("保存/更新本周体重"):
+            if weight <= 0:
+                st.error("体重必须大于 0。")
+            else:
+                upsert_weight_logs(conn, [{
+                    "week_key": wk,
+                    "log_date": log_dt.isoformat(),
+                    "weight_kg": weight,
+                    "note": note,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                }], replace=False)
+                st.success("体重记录已保存。")
+                st.rerun()
+
+    weight_df = export_weight_logs_df(conn)
+    if not weight_df.empty:
+        st.dataframe(weight_df, use_container_width=True)
+        try:
+            chart_df = weight_df.copy()
+            chart_df["log_date"] = pd.to_datetime(chart_df["log_date"])
+            st.line_chart(chart_df.set_index("log_date")[["weight_kg"]])
+        except Exception:
+            pass
+
+    st.divider()
+    st.subheader("摄入总结")
     mode = st.radio("范围", ["本周", "本月", "自定义"], horizontal=True)
     today = date.today()
     if mode == "本周":
@@ -600,6 +899,7 @@ def render_summary(conn: sqlite3.Connection) -> None:
         c1, c2 = st.columns(2)
         start = c1.date_input("开始日期", value=week_start(today), key="sum_start")
         end = c2.date_input("结束日期", value=today, key="sum_end")
+
     rows = conn.execute(
         """
         SELECT record_date, SUM(kcal) AS kcal, SUM(protein) AS protein, SUM(carbs) AS carbs,
@@ -611,16 +911,36 @@ def render_summary(conn: sqlite3.Connection) -> None:
         """,
         (start.isoformat(), end.isoformat()),
     ).fetchall()
-    if not rows:
-        st.info("这个范围没有记录。")
+    detail_df = export_daily_records_df(conn, start.isoformat(), end.isoformat())
+
+    if detail_df.empty:
+        st.info("这个范围没有记录。可以在上方导入历史 daily_records_master.csv，或在每天记录页添加食物。")
         return
+
     df = pd.DataFrame([dict(r) for r in rows])
+    st.write("每日汇总")
     st.dataframe(df, use_container_width=True)
     avg = {k: df[k].mean() for k in MACRO_KEYS if k in df.columns}
     st.write("平均每日摄入")
     render_macro_metrics(avg)
     st.line_chart(df.set_index("record_date")[["kcal", "protein", "carbs", "fat"]])
-    st.download_button("导出范围汇总 CSV", dataframe_csv(df), file_name=f"summary_{start}_{end}.csv", mime="text/csv")
+
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        "导出范围汇总 CSV",
+        csv_download_bytes(df),
+        file_name=f"summary_{start}_{end}.csv",
+        mime="text/csv; charset=utf-8",
+    )
+    c2.download_button(
+        "导出范围明细 CSV",
+        csv_download_bytes(detail_df),
+        file_name=f"daily_records_{start}_{end}.csv",
+        mime="text/csv; charset=utf-8",
+    )
+
+    with st.expander("查看范围内全部明细", expanded=False):
+        st.dataframe(detail_df, use_container_width=True)
 
 
 def render_food_database(conn: sqlite3.Connection) -> None:
@@ -698,11 +1018,11 @@ def render_food_database(conn: sqlite3.Connection) -> None:
     st.subheader("持久化：把食物库保存进 GitHub")
     st.warning("Streamlit Community Cloud 的本地 SQLite 文件不是长期存储。编辑后的数据请下载 foods_master.csv，然后上传/提交到 GitHub 仓库根目录。下次部署或重启后，App 会用仓库里的 foods_master.csv 初始化食物库。")
     current_csv = all_foods_as_csv(conn)
-    st.download_button("下载当前食物库为 foods_master.csv", current_csv, file_name="foods_master.csv", mime="text/csv")
+    st.download_button("下载当前食物库为 foods_master.csv", current_csv, file_name="foods_master.csv", mime="text/csv; charset=utf-8")
     uploaded = st.file_uploader("导入 foods_master.csv 并重建食物库", type=["csv"], key="food_seed_upload")
     if uploaded is not None:
         try:
-            text = uploaded.read().decode("utf-8-sig", errors="replace")
+            text = decode_csv_bytes(uploaded.read())
             df_seed = pd.read_csv(io.StringIO(text))
             rows = []
             for rec in df_seed.to_dict("records"):
@@ -776,7 +1096,7 @@ def main() -> None:
             st.warning("当前 week_key 没有菜单。请先导入 CSV/JSON。")
         else:
             df = pd.DataFrame([dict(r) for r in rows])
-            st.download_button("导出本周菜单 CSV", dataframe_csv(df), file_name=f"mensa_menu_{week_key}.csv", mime="text/csv")
+            st.download_button("导出本周菜单 CSV", dataframe_csv(df), file_name=f"mensa_menu_{week_key}.csv", mime="text/csv; charset=utf-8")
             dates = ["全部"] + sorted({clean_text(r["date"] or r["day"]) for r in rows if clean_text(r["date"] or r["day"])})
             selected_date = st.selectbox("筛选日期", dates)
             show_rows = [r for r in rows if selected_date == "全部" or clean_text(r["date"] or r["day"]) == selected_date]
@@ -804,7 +1124,7 @@ def main() -> None:
         render_macro_metrics(total, target)
         if records:
             rec_df = pd.DataFrame([dict(r) for r in records])
-            st.download_button("导出当天记录 CSV", dataframe_csv(rec_df), file_name=f"daily_record_{record_date}.csv", mime="text/csv")
+            st.download_button("导出当天记录 CSV（Excel不乱码）", dataframe_csv(rec_df), file_name=f"daily_record_{record_date}.csv", mime="text/csv; charset=utf-8")
             for r in records:
                 c = st.columns([1, 3, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8])
                 c[0].write(r["meal"])
